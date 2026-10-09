@@ -1,0 +1,24 @@
+Vull fer un programa per gestionar la traçabilitat dels productes que envaso i fabrico.
+
+El workflow ha de ser el següent:
+1. Quan m'arriben productes els poso una etiqueta on s'indica nom, nº lot, procedència i data de caducitat. Això s'indica en text i en codi de barres.
+
+2. Quan vull envasar un producte, llegeixo el codi de barres o l'escric amb el teclat i indico la quantitat que vull envasar. El programa guarda totes les dades de traçabilitat, genera el nº de lot corresponent i envia l'ordre d'imprimir les etiquetes corresponents a una impressora d'etiquetes (en aquest cas la Epson colorworks CW-C4000e).
+
+3. Quan vull envasar un producte que té diversos ingredients, selecciono el producte que vull envasar, i vaig llegint els codis de barres de cada ingredient. El programa guarda tota la traçabilitat i calcula la data de caducitat i genera el nº de lot corresponent. Igualment envia l'ordre d'imprimir les etiquetes corresponents.
+
+4. El programa ha de poder llegir un csv on hi ha la llista de productes amb els pesos corresponents. Les columnes on s'indica el SKU, nom i pès s'han de poder seleccionar quan s'importa el csv. Quan s'envia l'ordre d'imprimir l'etiqueta, també s'indica el pès corresponent indicat al csv.
+
+5. Al finalitzar la sessió, vull poder exportar un full amb tots els productes envasats durant aquesta sessió, on surti el nom, lot, caducitat i origen de cada producte.
+
+6. El programa ha de generar i mantenir actualitzada una base de dades amb tots els productes que s'han envasat amb totes les dades corresponents. I ha de tenir una eina potent i còmode amb la que poder cercar els productes per nº de lot del proveïdor o nº de lot d'envasat, data d'envasat, nom i caducitat.
+
+---
+
+El programa ha de funcionar en PC o linux de prestacions limitades. Tria el llenguatge més adequat.
+
+Tingues en compte que no sé programar, així que ho hauràs de fer tot i m'hauràs d'indicar detalladament els passos que necessitis que faci.
+
+Si tens dubtes sobre el funcionament del programa abans de començar a programar, consulta-m'ho.
+
+Endavant.
