@@ -26,6 +26,7 @@ from src.db import (
     search_catalog_products,
     search_distinct_raw_material_values,
     search_history_suggestions,
+    search_prepared_mixture_suggestions,
     search_packaging_ingredients,
     search_received_materials,
     update_raw_material,
@@ -118,6 +119,33 @@ def test_history_search_and_suggestions_respect_session_scope(tmp_path):
         assert suggestions[0] == "Frnaa"
         assert "Farina" in suggestions
         assert len(suggestions) == len(set(suggestions))
+    finally:
+        conn.close()
+
+
+def test_production_search_includes_nested_ingredient_snapshots(tmp_path):
+    conn = initialize_db(str(tmp_path / "test.db"))
+    try:
+        first = create_session(conn)
+        second = create_session(conn)
+        ingredients = [{"name": "Base", "sku": "010", "ingredients": [
+            {"name": "Marialluïsa", "sku": "001", "supplier_lot": "INGREDIENT-LOT", "expiry": "2027-12-01"},
+        ]}]
+        mixture = add_prepared_mixture(conn, "Infusió", "100", "PREP-1", "2027-12-01", ingredients)
+        add_prepared_mixture(conn, "Altra", "101", "PREP-2", "2027-12-01", [{"name": "Farina"}])
+        add_packaged_product(conn, "Infusió", "PACK-1", "", "", "2027-12-01", "PACK-1", 2, 0.25, first, ingredients, "100")
+        add_packaged_product(conn, "Altra", "PACK-2", "", "", "2027-12-01", "PACK-2", 2, 0.25, second, [], "101")
+        for term in ("marialluisa", "001", "INGREDIENT-LOT", "Base"):
+            assert [row["id"] for row in list_prepared_mixtures(conn, term)] == [mixture["id"]]
+            assert [row["name"] for row in list_history_packaged_products(conn, term)] == ["Infusió"]
+            assert list_history_packaged_products(conn, term, session_id=second) == []
+        assert "Marialluïsa" in search_prepared_mixture_suggestions(conn, "Mria Llusa")
+        assert "Marialluïsa" in search_history_suggestions(conn, "Mria Llusa", first)
+        assert search_history_suggestions(conn, "Mria Llusa", second) == []
+        assert search_prepared_mixture_suggestions(conn, "Infusio")[0] == "Infusió"
+        assert search_prepared_mixture_suggestions(conn, "inexistent") == []
+        conn.execute("UPDATE prepared_mixtures SET ingredients_json = 'invalid' WHERE id = ?", (mixture["id"],))
+        assert [row["id"] for row in list_prepared_mixtures(conn, "Infusio")] == [mixture["id"]]
     finally:
         conn.close()
 
@@ -680,10 +708,11 @@ def test_receipt_and_packaged_labels_have_distinct_fields(tmp_path, monkeypatch,
     captured.clear()
     barcode_factory = Mock(wraps=label_print.barcode.get)
     monkeypatch.setattr(label_print.barcode, "get", barcode_factory)
-    label_print.create_packaged_label_image("Barreja", "26101501", provenance, "2027-12-01")
+    label_print.create_packaged_label_image("Barreja", "26101501", provenance, "2027-12-01", weight=0.25)
     text = [line for line, size in captured]
     assert text[:3] == ["Barreja", "Lot: 26101501", "Consum preferent: 2027-12-01"]
-    assert len(text) == 3 + bool(provenance)
+    assert "Pes: 0.25 kg" in text
+    assert len(text) == 4 + bool(provenance)
     barcode_factory.assert_not_called()
 
 
@@ -781,11 +810,273 @@ def application(tmp_path, monkeypatch):
         app = app_module.TraceabilityApp()
     except tk.TclError as exc:
         pytest.skip(f"Tkinter necessita una pantalla: {exc}")
+    monkeypatch.setattr(app, "_show_label_saved_notice", Mock())
+    monkeypatch.setattr(app, "_choose_catalog_product", Mock(side_effect=lambda text, parent=None: {"name": text, "sku": None}))
     try:
         yield app, app_module, printer
     finally:
         app.conn.close()
         app.destroy()
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
+@pytest.mark.parametrize("key", ["Down", "Tab"])
+def test_package_recipe_keyboard_selection_and_full_height(application, size, key):
+    app, app_module, printer = application
+    first = upsert_recipe(app.conn, "001", "Barreja A", [{"name": "Farina", "sku": "010", "quantity": 2}])
+    second = upsert_recipe(app.conn, "002", "Barreja B", [{"name": "Oli", "sku": "020", "quantity": 1}])
+    app._populate_package_recipe_lookup()
+    app.geometry(size)
+    app.notebook.select(app.envasat_tab)
+    app.update()
+    entry = app.package_recipe_search_entry
+    tree = app.package_recipe_lookup_tree
+    entry.focus_force()
+    app.update()
+    entry.event_generate(f"<{key}>")
+    entry.event_generate(f"<KeyRelease-{key}>")
+    app.update()
+    assert tree.selection() == (str(first),)
+    assert app.focus_get() is tree
+    assert app.package_viewing_recipe["id"] == first
+    ingredients = app.package_recipe_ingredients_tree
+    assert ingredients.item(ingredients.get_children()[0], "values")[1] == "Farina"
+    tree.event_generate("<Down>")
+    app.update()
+    assert tree.selection() == (str(second),)
+    assert app.package_viewing_recipe["id"] == second
+    assert ingredients.item(ingredients.get_children()[0], "values")[1] == "Oli"
+    app._refresh_package_recipe_matching()
+    app.update()
+    assert tree.selection() == (str(second),)
+    lookup_title = next(child for child in entry.master.winfo_children()
+                        if isinstance(child, app_module.tk.Label))
+    ingredient_title = next(child for child in app.package_form_container.winfo_children()
+                            if isinstance(child, app_module.tk.Label)
+                            and child.cget("text") == "Ingredient (codi de barres / nom / SKU)")
+    assert abs(lookup_title.winfo_rooty() - ingredient_title.winfo_rooty()) <= 2
+    assert abs(entry.winfo_rooty() - app.package_ingredient_entry.winfo_rooty()) <= 2
+    assert ingredients.winfo_rooty() == ingredients.master.winfo_rooty()
+    assert ingredients.winfo_height() >= ingredients.master.winfo_height() - 25
+    assert tree.winfo_rooty() + tree.winfo_height() >= tree.master.winfo_rooty() + tree.master.winfo_height() - 25
+    assert not any(isinstance(child, app_module.tk.Label) for child in ingredients.master.winfo_children())
+    app.package_recipe_close_button.invoke()
+    app.update()
+    assert not tree.selection()
+    assert not ingredients.get_children()
+    assert app.package_viewing_recipe is None
+
+
+def test_requested_instruction_labels_are_removed(application):
+    app, app_module, printer = application
+
+    def labels(widget):
+        result = []
+        for child in widget.winfo_children():
+            if isinstance(child, app_module.tk.Label):
+                result.append(child)
+            result.extend(labels(child))
+        return result
+
+    reception_labels = labels(app.recepcion_tab)
+    assert not any(label.cget("text").startswith("Format de caducitat:") for label in reception_labels)
+    assert not any(str(label.cget("textvariable")) == str(app.raw_name_sku_var) for label in reception_labels)
+    assert not app.package_status.get()
+    assert not any(label.cget("text").startswith("Clica una cel·la i escriu") for label in labels(app.recipes_tab))
+    app._refresh_package_final_product_state()
+    assert not app.package_status.get()
+
+
+@pytest.mark.parametrize("choice", ["suggestion", "create", "cancel"])
+def test_unknown_product_dialog_updates_name_or_creates(application, monkeypatch, choice):
+    import tkinter as tk
+    from types import SimpleNamespace
+
+    app, app_module, printer = application
+    app_module.create_catalog_product(app.conn, "001", "Farina", "1", "Ingredients")
+    monkeypatch.setattr(app, "_choose_catalog_product", app_module.TraceabilityApp._choose_catalog_product.__get__(app))
+    app.raw_name.insert(0, "Frinaa")
+    failures = []
+
+    def interact():
+        dialog = app.grab_current()
+        try:
+            assert isinstance(dialog, tk.Toplevel)
+            children = dialog.winfo_children()
+            tree = next(child for child in children if isinstance(child, app_module.ttk.Treeview))
+            assert tree.item("0", "values")[0] == "Farina"
+            assert tree.winfo_ismapped()
+            frames = [child for child in children if isinstance(child, app_module.ttk.Frame)]
+            buttons = {child.cget("text"): child for frame in frames for child in frame.winfo_children()
+                       if isinstance(child, app_module.ttk.Button)}
+            if choice == "suggestion":
+                bounds = tree.bbox("0")
+                for timestamp in (1000, 1150):
+                    tree.event_generate("<ButtonPress-1>", x=bounds[0] + 30, y=bounds[1] + bounds[3] // 2, time=timestamp)
+                    if tree.winfo_exists():
+                        tree.event_generate("<ButtonRelease-1>", x=bounds[0] + 30, y=bounds[1] + bounds[3] // 2, time=timestamp + 30)
+            elif choice == "create":
+                panel = next(frame for frame in frames if "name" in frame.children)
+                assert panel.children["name"].get() == "Frinaa"
+                assert panel.children["sku"].get() == ""
+                buttons["Crear producte"].invoke()
+            else:
+                buttons["Cancel·lar"].invoke()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            if dialog is not None and dialog.winfo_exists():
+                dialog.destroy()
+
+    app.after(80, interact)
+    app._advance_received_field(SimpleNamespace(widget=app.raw_name))
+    assert not failures, failures
+    if choice == "suggestion":
+        assert app.raw_name.get() == "Farina"
+        assert app.raw_name_sku_var.get() == "SKU: 001"
+    else:
+        assert app.raw_name.get() == "Frinaa"
+    row = app_module.get_catalog_row_by_name(app.conn, "Frinaa")
+    if choice == "create":
+        assert row is not None
+        assert row["weight"] is None and row["sku"] == "" and row["category"] == ""
+        app.undo_action()
+        assert app_module.get_catalog_row_by_name(app.conn, "Frinaa") is None
+    else:
+        assert row is None
+
+
+def test_reference_editor_merges_and_undoes_loaded_ingredients(application, monkeypatch):
+    app, app_module, printer = application
+    add_raw_material(app.conn, "Farina", "Supplier", "LOT-1", "España", "2027-12-01", "RAW-1")
+    add_raw_material(app.conn, "Oli", "Supplier", "LOT-2", "Espanya", "2027-12-01", "RAW-2")
+    app.package_ingredients = [{"name": "Farina", "provenance": "España", "supplier": "Supplier",
+                                "supplier_lot": "LOT-1", "expiry": "2027-12-01", "barcode": "RAW-1",
+                                "ingredients": [{"name": "Oli", "provenance": "España"}]}]
+    monkeypatch.setattr(app_module.messagebox, "askyesno", Mock(return_value=True))
+    app._show_reference_data()
+    dialog = app.grab_current()
+    notebook = next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Notebook))
+    panel = notebook.nametowidget(notebook.tabs()[1])
+    notebook.select(panel)
+    app.update()
+    tree = next(child for child in panel.winfo_children() if isinstance(child, app_module.ttk.Treeview))
+    iid = next(iid for iid in tree.get_children() if tree.item(iid, "values")[0] == "España")
+    tree.selection_set(iid)
+    app.update()
+    edit_row = next(child for child in panel.winfo_children() if isinstance(child, app_module.ttk.Frame))
+    entry = edit_row.children["provenance"]
+    assert entry.get() == "España"
+    entry.delete(0, "end")
+    entry.insert(0, "Espanya")
+    next(child for child in edit_row.winfo_children() if isinstance(child, app_module.ttk.Button)).invoke()
+    assert app_module.list_reference_values(app.conn, "provenance") == ["Espanya"]
+    assert app.package_ingredients[0]["provenance"] == "Espanya"
+    assert app.package_ingredients[0]["ingredients"][0]["provenance"] == "Espanya"
+    assert len(tree.get_children()) == 1
+    dialog.destroy()
+    app.undo_action()
+    assert app.package_ingredients[0]["provenance"] == "España"
+    assert set(app_module.list_reference_values(app.conn, "provenance")) == {"España", "Espanya"}
+
+
+def test_printer_alert_checkbox_silences_until_new_session(application, monkeypatch, tmp_path):
+    app, app_module, printer = application
+    real_notice = app_module.TraceabilityApp._show_label_saved_notice.__get__(app)
+    monkeypatch.setattr(app, "_show_label_saved_notice", real_notice)
+    printer.return_value = {"status": "error", "message": "No printer"}
+    path = str(tmp_path / "label.png")
+    app._print_saved_labels([path])
+    dialog = app.grab_current()
+    checkbox = next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Checkbutton))
+    checkbox.invoke()
+    next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Button)).invoke()
+    app._print_saved_labels([path])
+    assert printer.call_count == 2
+    assert app.grab_current() is None
+    app._open_database(str(tmp_path / "next.db"))
+    assert not app.suppress_printer_alerts.get()
+    app._print_saved_labels([path])
+    assert app.grab_current() is not None
+    app.grab_current().destroy()
+
+
+def test_name_only_catalog_product_can_be_received(application):
+    app, app_module, printer = application
+    app_module.create_catalog_product(app.conn, "", "Nou producte")
+    first = app._register_received_material("Nou producte", "", "LOT-1", "", "")
+    second = app._register_received_material("Nou producte", "", "LOT-2", "", "")
+    assert first["barcode"] != second["barcode"]
+    assert first["name"] == "Nou producte"
+
+
+@pytest.mark.parametrize("width", [1000, 1200])
+def test_catalog_export_button_exports_all_products(application, monkeypatch, tmp_path, width):
+    import csv
+    app, app_module, printer = application
+    app_module.create_catalog_product(app.conn, "001", "Farina", "1", "Ingredients")
+    app_module.create_catalog_product(app.conn, "", "Nou")
+    row = app_module.get_catalog_row_by_sku(app.conn, "001")
+    app_module.update_catalog_field(app.conn, row["id"], "weight", 3)
+    app.refresh_product_catalog_table()
+    app.product_search_var.set("Farina")
+    app.geometry(f"{width}x650")
+    app.notebook.select(app.csv_tab)
+    app.product_edit_summary_var.set("1 SKU, 4 Noms i 6 Pesos modificats")
+    app.update()
+    actions = app.catalog_export_button.master
+    search_row = app.product_search_entry.master
+    assert actions.master is search_row
+    assert actions.grid_info()["row"] == 0
+    assert actions.grid_info()["column"] == 6
+    summary = next(child for child in search_row.winfo_children()
+                   if isinstance(child, app_module.tk.Label)
+                   and str(child.cget("textvariable")) == str(app.product_edit_summary_var))
+    assert summary.winfo_rootx() + summary.winfo_width() <= actions.winfo_rootx()
+    assert actions.winfo_rootx() + actions.winfo_width() <= app.winfo_rootx() + app.winfo_width()
+    assert all(child.winfo_ismapped() for child in actions.winfo_children())
+    path = tmp_path / "export.csv"
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", Mock(return_value=str(path)))
+    monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
+    app.catalog_export_button.invoke()
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert rows[0]["Pes"] == "3.0"
+    assert rows[1]["Nom"] == "Nou"
+
+
+def test_numeric_enter_matches_return(application):
+    import tkinter as tk
+    from types import SimpleNamespace
+
+    app, app_module, printer = application
+
+    def press(widget):
+        assert widget.bindtags()[0] == "NumericEnter"
+        if app.tk.call("tk", "windowingsystem") == "win32":
+            app._numeric_enter(SimpleNamespace(widget=widget, type=tk.EventType.KeyPress, state=0))
+        else:
+            widget.event_generate("<KP_Enter>")
+
+    app.update()
+    called = []
+    app.raw_name.bind("<Return>", lambda event: called.append(event.keysym))
+    app.raw_name.focus_force()
+    app.update()
+    press(app.raw_name)
+    app.update()
+    assert called == ["Return"]
+    app.notebook.select(app.recipes_tab)
+    app.update()
+    tree = app.recipe_ingredients_tree
+    tree.focus_force()
+    app.update()
+    row = tree.get_children()[0]
+    app._set_recipe_ing_active_cell(row, "SKU")
+    press(tree)
+    app.update()
+    assert app._recipe_ing_active_cell == (row, "Nom")
 
 
 def test_receipt_reprint_and_editor(application, monkeypatch):
@@ -864,7 +1155,7 @@ def test_receipt_reprint_and_editor(application, monkeypatch):
     assert dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone()) == after
     printer.side_effect = RuntimeError("Printer unavailable")
     app._received_print_buttons[str(material_id)].invoke()
-    assert app_module.messagebox.showwarning.called
+    assert app._show_label_saved_notice.called
     assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
 
 
@@ -931,7 +1222,7 @@ def test_receipt_print_reports_returned_failure(application, status):
     printer.return_value = {"status": status, "message": "Printer unavailable"}
     app._print_received_material({"name": "Farina", "supplier": "Supplier", "supplier_lot": "LOT-1",
                                   "provenance": "", "expiry": "2027-12-01", "barcode": "RAW-1"})
-    assert app_module.messagebox.showwarning.call_args.args[1] == "Printer unavailable"
+    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
 
 
 @pytest.mark.parametrize("size", ["1200x760", "1000x650"])
@@ -967,6 +1258,364 @@ def test_receipt_and_recipe_controls_fit_window(application, size):
         assert search.winfo_rootx() + search.winfo_width() <= control.winfo_rootx()
     right = app.recipe_list_tree.master
     assert app.recipe_export_button.winfo_rootx() + app.recipe_export_button.winfo_width() == right.winfo_rootx() + right.winfo_width()
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
+def test_history_heights_can_be_adjusted(application, size):
+    app, app_module, printer = application
+    app.geometry(size)
+    for tab, panes, tree in (
+        (app.envasat_tab, app.package_vertical_panes, app.package_history_tree),
+        (app.recipes_tab, app.recipes_vertical_panes, app.prepared_mixture_tree),
+    ):
+        app.notebook.select(tab)
+        app.update()
+        assert app.winfo_height() == int(size.split("x")[1])
+        assert tree.winfo_ismapped()
+        assert tree.winfo_height() >= 50
+        assert tree.winfo_rooty() + tree.winfo_height() <= app.winfo_rooty() + app.winfo_height()
+        initial_height = tree.winfo_height()
+        sash_x, sash_y = panes.sash_coord(0)
+        top, bottom = [app.nametowidget(name) for name in panes.panes()]
+        shrink = top.winfo_height() - int(panes.panecget(top, "minsize"))
+        grow = bottom.winfo_height() - int(panes.panecget(bottom, "minsize"))
+        delta = -min(50, max(0, shrink)) if shrink > 0 else min(50, max(0, grow))
+        panes.sash_place(0, sash_x, sash_y + delta)
+        app.update()
+        assert abs(tree.winfo_height() - (initial_height - delta)) <= 2
+        panes.sash_place(0, sash_x, sash_y)
+        app.update()
+        assert abs(tree.winfo_height() - initial_height) <= 2
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
+def test_packaging_ingredients_fill_space_above_quantity(application, size):
+    app, app_module, printer = application
+    app.geometry(size)
+    app.notebook.select(app.envasat_tab)
+    app.update()
+    panel = app.package_form_container.master
+    quantity_row = app.package_quantity_entry.master
+    assert not app.package_status_label.winfo_ismapped()
+    assert panel.winfo_rooty() + panel.winfo_height() - (quantity_row.winfo_rooty() + quantity_row.winfo_height()) <= 4
+    panes = app.package_vertical_panes
+    bottom = app.nametowidget(panes.panes()[1])
+    available = bottom.winfo_height() - int(panes.panecget(bottom, "minsize"))
+    delta = min(40, max(0, available))
+    initial_height = app.ingredients_list.winfo_height()
+    sash_x, sash_y = panes.sash_coord(0)
+    panes.sash_place(0, sash_x, sash_y + delta)
+    app.update()
+    assert abs(app.ingredients_list.winfo_height() - initial_height - delta) <= 2
+    assert panel.winfo_rooty() + panel.winfo_height() - (quantity_row.winfo_rooty() + quantity_row.winfo_height()) <= 4
+    app.package_status.set("Producte final seleccionat: Farina.")
+    app.update()
+    assert app.package_status_label.winfo_ismapped()
+    assert quantity_row.winfo_rooty() + quantity_row.winfo_height() <= app.package_status_label.winfo_rooty()
+    app.package_status.set("")
+    app.update()
+    assert not app.package_status_label.winfo_ismapped()
+    assert abs(app.ingredients_list.winfo_height() - initial_height - delta) <= 2
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
+def test_packaging_minimum_height_keeps_three_ingredients_visible(application, size):
+    app, app_module, printer = application
+    app.geometry(size)
+    app.notebook.select(app.envasat_tab)
+    for index in range(6):
+        app.ingredients_list.insert("end", f"Ingredient {index + 1}")
+    app.update()
+    panes = app.package_vertical_panes
+    sash_x, sash_y = panes.sash_coord(0)
+    panes.sash_place(0, sash_x, 0)
+    app.update()
+    ingredients = app.ingredients_list
+    for index in range(3):
+        bounds = ingredients.bbox(index)
+        assert bounds is not None
+        assert bounds[1] + bounds[3] <= ingredients.winfo_height() - int(ingredients.cget("borderwidth"))
+    top = app.package_top_panes.master
+    for entry in (app.package_final_product_entry, app.package_quantity_entry):
+        assert entry.winfo_ismapped()
+        assert entry.winfo_rooty() + entry.winfo_height() <= top.winfo_rooty() + top.winfo_height()
+    assert app.package_history_tree.winfo_height() >= 50
+
+
+@pytest.mark.parametrize("offset", [-6, 1, 7])
+def test_pane_drag_defers_content_resize_until_release(application, offset):
+    app, app_module, printer = application
+    app.geometry("1200x760")
+    for tab, panes in (
+        (app.envasat_tab, app.package_vertical_panes),
+        (app.envasat_tab, app.package_top_panes),
+        (app.envasat_tab, app.package_recipe_panes),
+        (app.recipes_tab, app.recipes_vertical_panes),
+    ):
+        app.notebook.select(tab)
+        app.update()
+        assert not panes.cget("opaqueresize")
+        assert int(panes.cget("sashwidth")) == 2
+        assert int(panes.cget("sashpad")) == 6
+        assert int(panes.cget("borderwidth")) == 0
+        assert str(panes.cget("sashrelief")) == "flat"
+        assert panes.winfo_rgb(panes.cget("background")) != panes.winfo_rgb("#999999")
+        line = panes._sash_lines[0]
+        assert line.cget("background") == "#999999"
+        horizontal = str(panes.cget("orient")) == "horizontal"
+        assert (line.winfo_width() if horizontal else line.winfo_height()) == 2
+        assert int(panes.cget("proxyborderwidth")) == 0
+        assert str(panes.cget("proxyrelief")) == "flat"
+        assert panes.cget("proxybackground") == "#666666"
+        children = [app.nametowidget(name) for name in panes.panes()]
+        before = [(child.winfo_width(), child.winfo_height()) for child in children]
+        sash_x, sash_y = panes.sash_coord(0)
+        start_x = sash_x + offset if horizontal else sash_x + 20
+        start_y = sash_y + 20 if horizontal else sash_y + offset
+        assert panes.identify(start_x, start_y) == (0, "sash")
+        panes.event_generate("<Motion>", x=start_x, y=start_y)
+        assert panes.cget("cursor") == ("sb_h_double_arrow" if horizontal else "sb_v_double_arrow")
+        target_x = start_x - 20 if str(panes.cget("orient")) == "horizontal" else start_x
+        target_y = start_y - 20 if str(panes.cget("orient")) == "vertical" else start_y
+        receiver = line if offset == 1 else panes
+        origin_x = receiver.winfo_rootx() - panes.winfo_rootx()
+        origin_y = receiver.winfo_rooty() - panes.winfo_rooty()
+        receiver.event_generate("<ButtonPress-1>", x=start_x - origin_x, y=start_y - origin_y)
+        receiver.event_generate("<B1-Motion>", x=target_x - origin_x, y=target_y - origin_y)
+        app.update()
+        assert [(child.winfo_width(), child.winfo_height()) for child in children] == before
+        receiver.event_generate("<ButtonRelease-1>", x=target_x - origin_x, y=target_y - origin_y)
+        app.update()
+        assert [(child.winfo_width(), child.winfo_height()) for child in children] != before
+        sash_x, sash_y = panes.sash_coord(0)
+        assert (line.winfo_x() if horizontal else line.winfo_y()) == (sash_x if horizontal else sash_y)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_packaged_weight_reaches_labels_and_histories(application, monkeypatch, tmp_path, prepared):
+    app, app_module, printer = application
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Nom actual", "weight": 0.25}], source_file="test")
+    ingredient = {"name": "Nom antic", "sku": "001", "supplier": "Supplier", "supplier_lot": "ENTRY-1",
+                  "provenance": "Catalunya", "expiry": "2027-12-01", "barcode": "RAW-1"}
+    factory = Mock(wraps=app_module.create_packaged_label_image)
+    monkeypatch.setattr(app_module, "create_packaged_label_image", factory)
+    if prepared:
+        mixture = add_prepared_mixture(app.conn, "Nom antic", "001", "LOT-1", "2027-12-01", [ingredient])
+        app._record_prepared_mixture_packaging(mixture, 2)
+    else:
+        app._add_package_ingredient(ingredient)
+        app.package_quantity_entry.insert(0, "2")
+        app._finalize_packaging()
+    packaged = app.conn.execute("SELECT * FROM packaged_products").fetchone()
+    assert packaged["weight"] == 0.25
+    assert factory.call_count == 2
+    assert all(call.kwargs["weight"] == 0.25 for call in factory.call_args_list)
+    app.conn.execute("UPDATE product_catalog SET weight = 99")
+    app.conn.commit()
+    app.populate_package_history()
+    app.refresh_history()
+    assert app.package_history_tree.set(str(packaged["id"]), "Pes (kg)") == "0.25"
+    assert app.history_tree.set(app.history_tree.get_children()[0], "Pes (kg)") == "0.25"
+    target = tmp_path / "session.csv"
+    export_session_csv(app.conn, app.session_id, str(target))
+    with target.open(encoding="utf-8-sig", newline="") as handle:
+        assert list(csv.DictReader(handle))[0]["pes_kg"] == "0.25"
+
+
+def test_saved_label_notice_has_clickable_directory_and_restores_editor(application, monkeypatch, tmp_path):
+    import tkinter as tk
+
+    app, app_module, printer = application
+    material_id = add_raw_material(app.conn, "Farina", "Supplier", "LOT-1", "", "2027-12-01", "RAW-1")
+    app._open_received_editor(material_id)
+    editor = app.grab_current()
+    assert editor.nametowidget("name").winfo_ismapped()
+    opened = Mock()
+    monkeypatch.setattr(app, "_open_label_directory", opened)
+    app_module.TraceabilityApp._show_label_saved_notice(app, str(tmp_path / "etiqueta.png"), parent=editor)
+    notice = app.grab_current()
+    labels = [child for child in notice.winfo_children() if isinstance(child, tk.Label)]
+    assert labels[0].cget("text") == "No s'ha trobat impressora, etiqueta guardada a"
+    assert labels[1].cget("text") == str(tmp_path.resolve())
+    labels[1].event_generate("<Button-1>")
+    app.update()
+    opened.assert_called_once_with(tmp_path.resolve(), parent=notice)
+    button = next(child for child in notice.winfo_children() if isinstance(child, app_module.ttk.Button))
+    button.invoke()
+    assert app.grab_current() is editor
+    editor.destroy()
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_label_directory_opens_system_file_manager(application, monkeypatch, tmp_path, platform):
+    app, app_module, printer = application
+    startfile = Mock()
+    popen = Mock()
+    monkeypatch.setattr(app_module.os, "startfile", startfile, raising=False)
+    monkeypatch.setattr(app_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(app_module.sys, "platform", platform)
+    app._open_label_directory(tmp_path)
+    if platform == "win32":
+        startfile.assert_called_once_with(str(tmp_path))
+        popen.assert_not_called()
+    else:
+        popen.assert_called_once_with(["xdg-open", str(tmp_path)])
+        startfile.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_initial_database_name_and_legacy_preservation(tmp_path, monkeypatch, legacy):
+    from pathlib import Path
+    import tkinter as tk
+    import src.app as app_module
+    import src.db as db_module
+
+    assert Path(db_module.DB_PATH).name == "Registre 1.db"
+    new_path = tmp_path / "data" / "Registre 1.db"
+    legacy_path = new_path.with_name("trazabilitat.db")
+    if legacy:
+        conn = initialize_db(str(legacy_path))
+        add_raw_material(conn, "Dades existents", "Supplier", "LOT-1", "", "2027-12-01", "RAW-1")
+        conn.close()
+    monkeypatch.setattr(app_module, "DB_PATH", str(new_path))
+    try:
+        app = app_module.TraceabilityApp()
+    except tk.TclError as exc:
+        pytest.skip(f"Tkinter necessita una pantalla: {exc}")
+    try:
+        assert Path(app.db_path) == (legacy_path if legacy else new_path)
+        assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == int(legacy)
+        assert new_path.exists() == (not legacy)
+    finally:
+        app.conn.close()
+        app.destroy()
+
+
+@pytest.mark.parametrize("status", ["printed", "skipped", "error", "exception"])
+def test_prepared_history_prints_production_sheet_without_changing_records(application, monkeypatch, status):
+    app, app_module, printer = application
+    mixture = add_prepared_mixture(app.conn, "Infusió", "100", "PREP-1", "2027-12-01", [
+        {"name": "Marialluïsa", "sku": "001", "supplier_lot": "ENTRY-1", "expiry": "2027-12-01"},
+    ])
+    app.notebook.select(app.recipes_tab)
+    app.populate_prepared_mixture_history()
+    app.update()
+    app.prepared_mixture_tree.xview_moveto(1)
+    app.update()
+    button = app._prepared_print_buttons[str(mixture["id"])]
+    assert button.winfo_ismapped()
+    assert button.winfo_width() == button.winfo_height()
+    button.event_generate("<Enter>")
+    assert app._prepared_print_tooltip is not None
+    button.event_generate("<Leave>")
+    assert app._prepared_print_tooltip is None
+    factory = Mock(wraps=app_module.create_mixture_label_image)
+    monkeypatch.setattr(app_module, "create_mixture_label_image", factory)
+    if status == "exception":
+        printer.side_effect = OSError("No printer")
+    else:
+        printer.return_value = {"status": status, "message": "Printer status"}
+    before = app.conn.serialize()
+    button.invoke()
+    printer.assert_called_once()
+    assert factory.call_args.args == (
+        mixture["name"], mixture["lot"], mixture["sku"], mixture["expiry"], mixture["barcode"],
+        mixture["created_at"], json.loads(mixture["ingredients_json"]),
+    )
+    with open(printer.call_args.args[0], "rb") as handle:
+        assert handle.read(5) == b"%PDF-"
+    assert app.conn.serialize() == before
+    assert not app.history.can_undo
+    if status == "printed":
+        app._show_label_saved_notice.assert_not_called()
+    else:
+        app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1200x760"])
+def test_prepared_print_buttons_follow_scroll_sort_and_resize(application, size):
+    app, app_module, printer = application
+    for index in range(15):
+        add_prepared_mixture(app.conn, f"Preparació {index:02}", "100", f"PREP-{index}", "2027-12-01", [{"name": "Farina"}])
+    app.geometry(size)
+    app.notebook.select(app.recipes_tab)
+    app.populate_prepared_mixture_history()
+    app.update()
+    tree = app.prepared_mixture_tree
+    tree.xview_moveto(1)
+    tree.yview_moveto(1)
+    app.update()
+    first, last = tree.get_children()[0], tree.get_children()[-1]
+    assert not app._prepared_print_buttons[first].winfo_ismapped()
+    assert app._prepared_print_buttons[last].winfo_ismapped()
+    app._sort_tree_by_column(tree, "Nom")
+    tree.see(first)
+    app.update()
+    bounds = tree.bbox(first, "Full")
+    button = app._prepared_print_buttons[first]
+    assert button.winfo_ismapped()
+    assert button.winfo_y() == bounds[1] + 1
+    assert button.winfo_x() + button.winfo_width() <= tree.winfo_width()
+    search = app.prepared_mixture_search_entry
+    assert search.winfo_rootx() + search.winfo_width() <= app.winfo_rootx() + app.winfo_width()
+    assert app.prepared_mixture_quantity_entry.winfo_rooty() + app.prepared_mixture_quantity_entry.winfo_height() <= app.winfo_rooty() + app.winfo_height()
+
+
+def test_prepared_history_search_suggests_nested_ingredients(application, tmp_path):
+    from types import SimpleNamespace
+
+    app, app_module, printer = application
+    mixture = add_prepared_mixture(app.conn, "Infusió", "100", "PREP-1", "2027-12-01", [
+        {"name": "Base", "ingredients": [{"name": "Marialluïsa", "supplier_lot": "ENTRY-1"}]},
+    ])
+    add_prepared_mixture(app.conn, "Pa", "101", "PREP-2", "2027-12-01", [{"name": "Farina"}])
+    app.notebook.select(app.recipes_tab)
+    app.populate_prepared_mixture_history()
+    app.update()
+    search = app.prepared_mixture_search_entry
+    search.insert(0, "Mria Llusa")
+    app._on_prepared_mixture_search_keyrelease(SimpleNamespace(keysym="a"))
+    assert "Marialluïsa" in app.suggestions_items
+    app._on_suggestions_down_from(search)
+    app._on_suggestions_accept(None)
+    assert search.get() == "Marialluïsa"
+    assert app.prepared_mixture_tree.get_children() == (str(mixture["id"]),)
+    assert set(app._prepared_print_buttons) == {str(mixture["id"])}
+    assert app.suggestions_anchor_entry is None
+    app._clear_prepared_mixture_search()
+    assert len(app.prepared_mixture_tree.get_children()) == 2
+    search.insert(0, "ENTRY-1")
+    app._submit_prepared_mixture_search()
+    assert app.prepared_mixture_tree.get_children() == (str(mixture["id"]),)
+    search.delete(0, "end")
+    search.insert(0, "inexistent")
+    app._on_prepared_mixture_search_keyrelease()
+    assert not app.prepared_mixture_tree.get_children()
+    assert not app._prepared_print_buttons
+    assert app.suggestions_anchor_entry is None
+    app._open_database(str(tmp_path / "other.db"))
+    assert search.get() == ""
+    printer.assert_not_called()
+
+
+def test_history_search_shows_packaged_products_by_nested_ingredient(application):
+    app, app_module, printer = application
+    other_session = create_session(app.conn)
+    ingredients = [{"name": "Base", "ingredients": [{"name": "Marialluïsa", "supplier_lot": "ENTRY-1"}]}]
+    for session_id, lot in ((app.session_id, "PACK-1"), (other_session, "PACK-2")):
+        add_packaged_product(app.conn, "Infusió", lot, "", "", "2027-12-01", lot, 2, 0.25, session_id, ingredients, "100")
+    app.notebook.select(app.historial_tab)
+    app.search_var.insert(0, "Mria Llusa")
+    app._on_history_search_keyrelease()
+    assert "Marialluïsa" in app.suggestions_items
+    app._on_suggestions_down_from(app.search_var)
+    app._on_suggestions_accept(None)
+    assert [app.history_tree.item(iid, "values")[0] for iid in app.history_tree.get_children()] == ["Infusió"]
+    app.history_all_sessions_check.invoke()
+    rows = [app.history_tree.item(iid) for iid in app.history_tree.get_children()]
+    assert [row["values"][0] for row in rows if "session_separator" not in row["tags"]] == ["Infusió", "Infusió"]
+    assert all("search_match" in app.sessions_tree.item(str(session_id), "tags") for session_id in (app.session_id, other_session))
+    printer.assert_not_called()
 
 
 def prepare_form(app, quantity=0):
@@ -1012,7 +1661,7 @@ def test_new_receipt_reports_saved_file_without_printer(application, monkeypatch
     app.save_received_material()
     assert printer.call_count == 1
     assert Path(printer.call_args.args[0]).is_file()
-    assert printer.call_args.args[0] in app_module.messagebox.showwarning.call_args.args[1]
+    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
     app_module.messagebox.showinfo.assert_not_called()
     assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
 
@@ -1080,7 +1729,7 @@ def test_preparation_survives_print_failure(application, monkeypatch):
     prepare_form(app)
     app._finalize_packaging()
     assert len(list_prepared_mixtures(app.conn)) == 1
-    assert app_module.messagebox.showwarning.called
+    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
     assert app.conn.execute("SELECT COUNT(*) FROM packaged_products").fetchone()[0] == 0
 
 
@@ -1221,7 +1870,7 @@ def test_history_validates_quantity_and_keeps_packaging_on_print_failure(applica
     app.prepared_mixture_quantity_entry.insert(0, "2")
     printer.side_effect = RuntimeError("Printer unavailable")
     app._on_package_prepared_mixture()
-    assert app_module.messagebox.showwarning.called
+    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
     packed = app.conn.execute("SELECT * FROM packaged_products").fetchone()
     assert packed["quantity"] == 2
     assert packed["prepared_mixture_id"] == mixture["id"]
@@ -1233,16 +1882,16 @@ from src.db import export_session_csv, replace_catalog_rows, upsert_catalog_rows
 from src.history import ActionHistory, Snapshot
 
 
-def test_export_session_csv_includes_quantity(tmp_path):
+def test_export_session_csv_includes_quantity_and_weight(tmp_path):
     conn = initialize_db(str(tmp_path / "test.db"))
     try:
-        add_packaged_product(conn, "Te", "LOT-1", "", "Cat", "2027-01-01", "LOT-1", 7, 0, 5, [], "1")
+        add_packaged_product(conn, "Te", "LOT-1", "", "Cat", "2027-01-01", "LOT-1", 7, 0.25, 5, [], "1")
         target = tmp_path / "out.csv"
         assert export_session_csv(conn, 5, str(target)) == 1
         with open(target, encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.reader(handle))
-        assert rows[0] == ["nom", "lot", "caducitat", "origen", "quantitat"]
-        assert rows[1] == ["Te", "LOT-1", "2027-01-01", "Cat", "7"]
+        assert rows[0] == ["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg"]
+        assert rows[1] == ["Te", "LOT-1", "2027-01-01", "Cat", "7", "0.25"]
     finally:
         conn.close()
 

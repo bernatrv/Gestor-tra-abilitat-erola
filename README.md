@@ -2,6 +2,12 @@
 
 Aquest projecte és una aplicació de Windows/Linux per gestionar la traçabilitat de materials i productes envasats.
 
+## Versions del programa
+
+La versió actual és **0.1.0-alpha.2**. El número es desa a `VERSION` i els paquets de cada versió es conserven en una carpeta separada dins de `versions/`, sense sobreescriure les anteriors. Consulta [l'historial de versions](versions/README.md) per veure les novetats i el procés de publicació.
+
+Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'executable de Windows i el ZIP de fonts per a Linux amb la versió al nom, juntament amb les sumes SHA-256. No inclou les dades de l'usuari. Per publicar la següent alfa, actualitza `VERSION` a `0.1.0-alpha.3` i afegeix les novetats a l'historial abans d'executar el script.
+
 ## Funcionalitats principals
 
 - Alta de productes rebuts amb nom, lot, procedència i caducitat.
@@ -11,7 +17,9 @@ Aquest projecte és una aplicació de Windows/Linux per gestionar la traçabilit
 - Envasat d'un producte amb una o diverses matèries primeres i quantitat.
 - Registre de barreges sense envasar, amb codi de barres propi i etiqueta amb la traçabilitat de tots els ingredients.
 - Historial de preparacions a Receptes, amb envasat posterior i impressió d'una etiqueta per unitat.
-- Importació de CSV amb selecció de columnes: SKU, nom i pes.
+- Importació de CSV amb selecció de columnes: SKU, nom, pes i categoria, i exportació del catàleg actualitzat.
+- Avís de productes fora del catàleg amb suggeriments aproximats i alta de productes nous.
+- Edició i unificació de proveïdors i orígens a tota la base de dades.
 - Generació automàtica de lot d'envasat i càlcul de la caducitat mínima.
 - Impressió d'etiquetes cap a la impressora Epson ColorWorks CW-C4000e si la impressora està configurada a l'ordinador.
 - Base de dades SQLite amb historial complet.
@@ -47,10 +55,14 @@ Cada etiqueta té un nom únic amb producte, lot, data i hora, inclosos microseg
 ### Formats impresos
 
 - **Recepció (PNG, 300 ppp):** nom complet del producte, proveïdor, lot d'entrada, origen si està informat, caducitat i codi de barres Code128 amb el valor llegible a sota.
-- **Envasat (PNG, 300 ppp):** nom complet del producte, número de lot i consum preferent; origen només si està informat. No inclou codi de barres ni les dades de recepció.
+- **Envasat (PNG, 300 ppp):** nom complet del producte, número de lot, consum preferent i pes net per unitat en kg; origen només si està informat. No inclou codi de barres ni les dades de recepció.
 - **Recepta / barreja preparada (PDF A4):** nom de la barreja, lot de sortida, data de producció i consum preferent. La taula d'ingredients mostra nom, proveïdor, lot d'entrada, caducitat i origen, amb columnes proporcionades i text ajustat. Conserva els ingredients de barreges niades i els codis de traçabilitat. Les taules llargues continuen en pàgines numerades amb capçaleres repetides. També es manté el codi de barres de la barreja per poder-la escanejar a Envasat.
 
 El full de recepta es genera en confirmar la impressió de traçabilitat quan es prepara una barreja a Envasat; no en desar només la definició d'una recepta sense ingredients rebuts ni lot de producció.
+
+Si no es pot imprimir, l'avís mostra «No s'ha trobat impressora, etiqueta guardada a» i el directori clicable on s'ha desat. L'enllaç obre l'explorador de fitxers del sistema, tant a Windows com a Linux (mitjançant `xdg-open`). També s'aplica al full de barreja.
+
+El checkbox «No mostrar més avisos d'impressora durant aquesta sessió» silencia aquests avisos fins que s'inicia una nova sessió (en reiniciar el programa o obrir una base de dades). Les etiquetes es continuen generant i desant, i el programa continua intentant imprimir-les.
 
 ### Icona del programa
 
@@ -103,6 +115,26 @@ Els executables són portables: les carpetes `data` i `output` es creen al costa
 
 Els camps de text editables ressalten amb un fons groc clar mentre tenen el focus i recuperen el fons original en sortir-ne. Això també s'aplica als editors de cel·les i als diàlegs; els camps de només lectura no es ressalten.
 
+L'Intro del teclat numèric té el mateix comportament que l'Intro normal, també als suggeriments, diàlegs i editors de cel·les.
+
+### Catàleg de productes
+
+En confirmar un nom que no coincideix amb cap producte del catàleg, apareix un avís amb els noms més semblants. Un doble clic sobre una alternativa substitueix el nom introduït. També es pot seleccionar una alternativa i prémer Intro o «Seleccionar».
+
+El mateix diàleg permet crear un producte amb SKU, nom, pes en kg i categoria. Només el nom és obligatori; el pes buit es desa sense valor, no com un pes zero. Els SKU es conserven com a text, inclosos els zeros inicials. No es permet crear un producte amb un nom o SKU ja existent. Cancel·lar conserva el text original. La comprovació es fa en confirmar el nom a Recepció i Envasat, i en confirmar el producte o desar els ingredients d'una recepta; també s'aplica a Recepció ràpida.
+
+A la part inferior dreta de Productes, al costat del resum de modificacions, hi ha el botó de productes modificats i «Exportar catàleg CSV», que desa tots els productes, independentment de la cerca activa. El CSV UTF-8 inclou les columnes SKU, Nom, Pes i Categoria amb els valors actuals, incloses les modificacions i les altes manuals. Es pot tornar a importar seleccionant aquestes columnes; exportar no esborra les marques de modificació ni substitueix automàticament el CSV original.
+
+### Proveïdors i orígens
+
+El menú «Base de dades > Proveïdors i orígens...» obre una finestra amb dues llistes. Selecciona un valor, modifica «Nou valor» i prem «Desar». La confirmació aplica el canvi a totes les recepcions, preparacions i envasats relacionats, inclosos els ingredients de barreges niades i els ingredients carregats a Envasat.
+
+Si el valor de destí ja existeix, les referències queden unificades: per exemple, canviar «España» a «Espanya» deixa un únic origen. El canvi es pot desfer i refer des del menú Edita. Els fitxers d'etiquetes i CSV ja exportats no es reescriuen; cal tornar-los a generar per reflectir la correcció.
+
+La primera arrencada crea `data/Registre 1.db`. Si encara no existeix i hi ha una base antiga `data/trazabilitat.db`, s'obre aquesta per conservar l'accés a les dades existents.
+
+A Envasat i Receptes, arrossega el separador horitzontal situat sobre l'historial per ajustar-ne l'alçada. Durant l'arrossegament es mou una guia i el contingut s'ajusta en deixar anar el ratolí per evitar parpelleigs; també s'aplica als separadors verticals d'Envasat. La part superior d'Envasat conserva espai per a almenys tres ingredients afegits i els camps de producte final i quantitat. Els historials d'envasats i el CSV de sessió inclouen el pes net per unitat en kg (columna `pes_kg` al CSV), conservat tal com era en registrar l'envasat encara que després es modifiqui el catàleg.
+
 ### Sessions de l'historial
 
 La pestanya Historial / exportació mostra una llista de sessions a l'esquerra de la taula, amb identificador i data d'inici. Per defecte se selecciona la sessió actual, marcada amb «(actual)». Seleccionar-ne una altra mostra els seus envasats; per defecte, la cerca per nom, lot, origen o dates només s'aplica a aquesta sessió.
@@ -110,6 +142,8 @@ La pestanya Historial / exportació mostra una llista de sessions a l'esquerra d
 El checkbox «Totes les sessions», al costat de «Buscar», amplia la cerca i els suggeriments a totes les sessions. En aquest mode, els resultats es mostren agrupats, amb una franja separadora que identifica cada sessió i la seva data d'inici. Les sessions que contenen resultats de la cerca ressalten en verd clar i negreta a la llista de l'esquerra, sense canviar la sessió seleccionada per exportar. El ressaltat desapareix quan es neteja el text, no hi ha resultats o es desactiva la cerca global.
 
 Els suggeriments del cercador inclouen noms, lots, orígens i dates del mateix abast. Ignoren accents, admeten errades i variacions dels espais, i prioritzen les coincidències exactes abans de les aproximades; per exemple, «Frnaa» pot suggerir «Farina». Pots seleccionar-ne un amb el ratolí o amb fletxa avall i Intro per aplicar la cerca amb el text correcte.
+
+La cerca i els suggeriments també inclouen els ingredients de cada envasat, inclosos els de barreges niades. Buscar el nom, SKU, lot o codi d'un ingredient mostra els productes envasats que el contenen. Es consulten les dades històriques desades a cada envasat, no la definició actual de la recepta, i es respecta la sessió seleccionada o l'opció «Totes les sessions».
 
 El botó «✕» neteja el text, tanca els suggeriments i torna a mostrar els registres sense filtre de text, mantenint l'estat de «Totes les sessions».
 
@@ -155,6 +189,10 @@ Amb el formulari d'Envasat buit, escanejar el codi d'una barreja recupera autom�
 També pots trobar la preparació pel nom o SKU al mateix cercador dels productes rebuts. Si ja hi ha ingredients afegits, seleccionar una altra barreja la incorpora com a ingredient niat, conservant-ne la traçabilitat original i sense esborrar els ingredients que s'havien introduït.
 
 A la part inferior de Receptes apareix l'historial de preparacions amb nom, SKU, lot, caducitat, data i codi de barres. L'historial d'envasats també mostra el codi de la preparació vinculada, si n'hi ha. Selecciona una preparació i prem Intro per passar al camp Quantitat. Introdueix un enter positiu i prem Intro o el botó «Imprimir i registrar envasat». Es manté el lot de la preparació, es registra l'envasat i s'imprimeix el nombre indicat d'etiquetes de producte. Si falla la impressió, el registre es conserva i es mostra un avís.
+
+El botó amb icona d'impressora a la dreta de cada preparació genera i imprimeix el seu full de producció PDF A4, també si ja s'ha envasat o mai no se n'havia generat el full. Utilitza les dades i els ingredients desats de la preparació, sense crear ni modificar registres de preparació o envasat. Si falla la impressora, el PDF es conserva i l'avís permet obrir-ne el directori.
+
+El cercador de l'historial de preparacions filtra per nom, SKU, lot, codi i dates, i també per les dades dels ingredients, inclosos els niats. Mostra suggeriments que ignoren accents i admeten errades i variacions dels espais. Tria'ls amb el ratolí o amb fletxa avall i Intro. El botó «✕» o Escape netegen la cerca.
 
 Fes doble clic a una preparació per obrir «Modificar preparació». Nom i SKU són de només lectura. Pots canviar el lot, el codi de barres, el consum preferent, la data de producció i les dades dels ingredients. Fes doble clic en una cel·la per editar-la; també pots afegir o eliminar ingredients. Les barreges niades es mostren desplegades i es conserven les dades no modificades. «Guardar» valida i desa; «Cancel·lar» descarta els canvis. L'edició es pot desfer i refer. Els envasats anteriors mantenen els seus lots i les còpies històriques dels ingredients.
 

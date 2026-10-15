@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 
 from src.core import generate_barcode_from_sku, parse_date
 
-DB_PATH = os.path.join("data", "trazabilitat.db")
+DB_PATH = os.path.join("data", "Registre 1.db")
 
 
 def connect_db(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -178,6 +178,28 @@ def list_session_packaged_products(conn: sqlite3.Connection, session_id: int, te
     return list_history_packaged_products(conn, term=term, session_id=session_id)
 
 
+def _production_search_values(row, columns):
+    values = [row[column] for column in columns]
+    try:
+        ingredients = json.loads(row["ingredients_json"] or "[]")
+    except (ValueError, TypeError):
+        return values
+
+    def append_ingredients(items):
+        if not isinstance(items, list):
+            return
+        for ingredient in items:
+            if not isinstance(ingredient, dict):
+                continue
+            values.extend(ingredient.get(key) for key in (
+                "name", "sku", "supplier", "supplier_lot", "provenance", "expiry", "barcode", "created_at",
+            ))
+            append_ingredients(ingredient.get("ingredients"))
+
+    append_ingredients(ingredients)
+    return values
+
+
 def list_history_packaged_products(conn: sqlite3.Connection, term: str = "", session_id: int | None = None):
     rows = conn.execute(
         "SELECT p.*, s.started_at AS session_started_at FROM packaged_products p "
@@ -187,17 +209,23 @@ def list_history_packaged_products(conn: sqlite3.Connection, term: str = "", ses
     ).fetchall()
     query = _suggestion_key(term)
     columns = ("name", "packed_lot", "supplier_lot", "provenance", "expiry", "created_at")
-    return [row for row in rows if not query or any(query in _suggestion_key(row[column]) for column in columns)]
+    return [row for row in rows if not query or any(query in _suggestion_key(value) for value in _production_search_values(row, columns))]
 
 
 def search_history_suggestions(conn: sqlite3.Connection, term: str, session_id: int | None = None, limit: int = 8):
+    return _production_suggestions(
+        list_history_packaged_products(conn, session_id=session_id), term,
+        ("name", "packed_lot", "supplier_lot", "provenance", "expiry", "created_at"), limit,
+    )
+
+
+def _production_suggestions(rows, term, columns, limit):
     if not _suggestion_key(term):
         return []
     candidates = []
     seen = set()
-    for row in list_history_packaged_products(conn, session_id=session_id):
-        for column in ("name", "packed_lot", "supplier_lot", "provenance", "expiry", "created_at"):
-            value = row[column]
+    for row in rows:
+        for value in _production_search_values(row, columns):
             key = _suggestion_key(value)
             if key and key not in seen:
                 seen.add(key)
@@ -421,8 +449,17 @@ def update_prepared_mixture(conn, mixture_id, lot, expiry, barcode, created_at, 
         )
 
 
-def list_prepared_mixtures(conn):
-    return conn.execute("SELECT * FROM prepared_mixtures ORDER BY created_at DESC, id DESC").fetchall()
+def list_prepared_mixtures(conn, term=""):
+    rows = conn.execute("SELECT * FROM prepared_mixtures ORDER BY created_at DESC, id DESC").fetchall()
+    query = _suggestion_key(term)
+    columns = ("name", "sku", "lot", "expiry", "created_at", "barcode")
+    return [row for row in rows if not query or any(query in _suggestion_key(value) for value in _production_search_values(row, columns))]
+
+
+def search_prepared_mixture_suggestions(conn, term, limit=8):
+    return _production_suggestions(
+        list_prepared_mixtures(conn), term, ("name", "sku", "lot", "expiry", "created_at", "barcode"), limit,
+    )
 
 
 def get_packaging_ingredient_by_barcode(conn, barcode):
@@ -541,6 +578,102 @@ def replace_catalog_rows(conn: sqlite3.Connection, rows: list[dict], source_file
 
 def list_catalog_products(conn: sqlite3.Connection):
     return conn.execute("SELECT * FROM product_catalog ORDER BY name COLLATE NOCASE").fetchall()
+
+
+def create_catalog_product(conn, sku, name, weight="", category=""):
+    name, sku = name.strip(), sku.strip()
+    if not name:
+        raise ValueError("Cal indicar el nom.")
+    if get_catalog_row_by_name(conn, name) is not None:
+        raise ValueError("Ja existeix un producte amb aquest nom.")
+    if sku and get_catalog_row_by_sku(conn, sku) is not None:
+        raise ValueError("Ja existeix un producte amb aquest SKU.")
+    try:
+        weight = float(str(weight).replace(",", ".")) if str(weight).strip() else None
+    except ValueError:
+        raise ValueError("El pes ha de ser un número positiu o zero.") from None
+    if weight is not None and (not math.isfinite(weight) or weight < 0):
+        raise ValueError("El pes ha de ser un número positiu o zero.")
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO product_catalog (sku, name, weight, category, source_file, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (sku, name, weight, category.strip(), "Manual", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+    return conn.execute("SELECT * FROM product_catalog WHERE id = ?", (cursor.lastrowid,)).fetchone()
+
+
+def export_catalog_csv(conn, output_path):
+    rows = list_catalog_products(conn)
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("SKU", "Nom", "Pes", "Categoria"))
+        writer.writerows((row["sku"] or "", row["name"], row["weight"] if row["weight"] is not None else "",
+                         row["category"] or "") for row in rows)
+    return len(rows)
+
+
+def replace_reference_values(value, column, old, new):
+    if isinstance(value, list):
+        for item in value:
+            replace_reference_values(item, column, old, new)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key == column and item == old:
+                value[key] = new
+            elif isinstance(item, (dict, list)):
+                replace_reference_values(item, column, old, new)
+
+
+def list_reference_values(conn, column):
+    if column not in _ALLOWED_SUGGESTION_COLUMNS:
+        raise ValueError("Camp no permès.")
+    values = {row[0] for row in conn.execute(f"SELECT DISTINCT {column} FROM raw_materials") if row[0]}
+    if column == "provenance":
+        values.update(row[0] for row in conn.execute("SELECT DISTINCT provenance FROM packaged_products") if row[0])
+
+    def collect(value):
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            if isinstance(value.get(column), str) and value[column].strip():
+                values.add(value[column])
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    collect(item)
+
+    for table in ("prepared_mixtures", "packaged_products"):
+        for row in conn.execute(f"SELECT ingredients_json FROM {table}"):
+            try:
+                collect(json.loads(row[0] or "[]"))
+            except (ValueError, TypeError):
+                pass
+    return sorted(values, key=_suggestion_key)
+
+
+def rename_reference_value(conn, column, old, new):
+    if column not in _ALLOWED_SUGGESTION_COLUMNS:
+        raise ValueError("Camp no permès.")
+    new = new.strip()
+    if not old or not new:
+        raise ValueError("Cal indicar el valor original i el nou valor.")
+    if old == new:
+        return
+    with conn:
+        conn.execute(f"UPDATE raw_materials SET {column} = ? WHERE {column} = ?", (new, old))
+        if column == "provenance":
+            conn.execute("UPDATE packaged_products SET provenance = ? WHERE provenance = ?", (new, old))
+        for table in ("prepared_mixtures", "packaged_products"):
+            for row in conn.execute(f"SELECT id, ingredients_json FROM {table}").fetchall():
+                try:
+                    ingredients = json.loads(row["ingredients_json"] or "[]")
+                except (ValueError, TypeError):
+                    continue
+                before = json.dumps(ingredients, ensure_ascii=False)
+                replace_reference_values(ingredients, column, old, new)
+                after = json.dumps(ingredients, ensure_ascii=False)
+                if before != after:
+                    conn.execute(f"UPDATE {table} SET ingredients_json = ? WHERE id = ?", (after, row["id"]))
 
 
 _CATALOG_EDITABLE_COLUMNS = {"sku", "name", "weight"}
@@ -774,15 +907,15 @@ def search_packaged(conn: sqlite3.Connection, term: str):
 
 def export_session_csv(conn: sqlite3.Connection, session_id: int, target_path: str):
     rows = conn.execute(
-        "SELECT name, packed_lot AS lot, expiry AS caducitat, provenance AS origen, quantity AS quantitat FROM packaged_products WHERE session_id = ? ORDER BY created_at DESC",
+        "SELECT name, packed_lot AS lot, expiry AS caducitat, provenance AS origen, quantity AS quantitat, weight AS pes_kg FROM packaged_products WHERE session_id = ? ORDER BY created_at DESC",
         (session_id,),
     ).fetchall()
 
     with open(target_path, "w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["nom", "lot", "caducitat", "origen", "quantitat"])
+        writer.writerow(["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg"])
         for row in rows:
-            writer.writerow([row["name"], row["lot"], row["caducitat"], row["origen"], row["quantitat"]])
+            writer.writerow([row["name"], row["lot"], row["caducitat"], row["origen"], row["quantitat"], row["pes_kg"]])
 
     return len(rows)
 

@@ -1,0 +1,9 @@
+﻿{
+    "version":  "0.1.0-alpha.2",
+    "phase":  "alpha",
+    "built_at_utc":  "2026-10-15T17:02:54.0605013Z",
+    "windows":  "windows/erola-produccio-0.1.0-alpha.2-windows.exe",
+    "linux_sources":  "linux/erola-produccio-0.1.0-alpha.2-linux-fonts.zip",
+    "linux_native_verified":  false,
+    "excludes_user_data":  true
+}

@@ -7,10 +7,9 @@ venv/
 .pytest_cache/
 build/
 dist/
-.tmp.driveupload/
-.tmp.drivedownload/
+.tmp.drive*/
 Receptes/
 output/
-data/*.db
-data/*.db-*
+data/*
+!data/.gitkeep
 *.log

@@ -1,0 +1,2 @@
+eb8ff26796b2d03c1e50708c9bfc089c111d7b6354b3ee9f914ef5de7e607479  windows/erola-produccio-0.1.0-alpha.2-windows.exe
+f1ff409264992c991d7fb4e23a363de1be29dba57775acc426849433873e651d  linux/erola-produccio-0.1.0-alpha.2-linux-fonts.zip

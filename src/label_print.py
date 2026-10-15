@@ -110,8 +110,9 @@ def create_label_image(
     return _render_product_label(product_name, lot_number, lines, barcode_value)
 
 
-def create_packaged_label_image(product_name: str, lot_number: str, provenance: str, expiry_date: str) -> str:
+def create_packaged_label_image(product_name: str, lot_number: str, provenance: str, expiry_date: str, weight: float | None = None) -> str:
     lines = [f"Lot: {lot_number}", f"Consum preferent: {expiry_date}"]
+    lines.append(f"Pes: {weight:g} kg" if weight is not None else "Pes: -")
     if provenance:
         lines.append(f"Origen: {provenance}")
     return _render_product_label(product_name, lot_number, lines)

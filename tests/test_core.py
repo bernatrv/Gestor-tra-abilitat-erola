@@ -12,6 +12,51 @@ from src.core import (
 )
 
 
+def test_catalog_creation_export_and_reference_merge(tmp_path):
+    import csv
+    import json
+    from src.db import (initialize_db, create_catalog_product, export_catalog_csv, update_catalog_field,
+                        add_raw_material, rename_reference_value, list_reference_values)
+
+    conn = initialize_db(str(tmp_path / "catalog.db"))
+    try:
+        product = create_catalog_product(conn, "001", "Farina", "1,5", "Aliment")
+        create_catalog_product(conn, "", "Producte nou")
+        with pytest.raises(ValueError):
+            create_catalog_product(conn, "001", "Duplicat")
+        with pytest.raises(ValueError):
+            create_catalog_product(conn, "", " ")
+        with pytest.raises(ValueError):
+            create_catalog_product(conn, "", "Invàlid", "nan")
+        update_catalog_field(conn, product["id"], "weight", 2.5)
+        output = tmp_path / "catalog.csv"
+        assert export_catalog_csv(conn, output) == 2
+        with output.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert rows[0] == {"SKU": "001", "Nom": "Farina", "Pes": "2.5", "Categoria": "Aliment"}
+        assert rows[1]["Pes"] == ""
+        add_raw_material(conn, "Farina", "Supplier", "LOT", "España", "2027-12-01", "RAW")
+        nested = [{"provenance": "España", "supplier": "Supplier", "ingredients": [
+            {"provenance": "España", "supplier": "Supplier", "supplier_lot": "España"}]}]
+        conn.execute("INSERT INTO prepared_mixtures (name, lot, expiry, barcode, created_at, ingredients_json) "
+                     "VALUES ('Mix', 'LOT', '2027-12-01', 'MIX', '2026-10-15', ?)", (json.dumps(nested),))
+        conn.execute("INSERT INTO packaged_products (name, packed_lot, provenance, created_at, ingredients_json) "
+                     "VALUES ('Mix', 'LOT', 'España', '2026-10-15', ?)", (json.dumps(nested),))
+        conn.commit()
+        rename_reference_value(conn, "provenance", "España", "Espanya")
+        rename_reference_value(conn, "supplier", "Supplier", "Unificat")
+        assert list_reference_values(conn, "provenance") == ["Espanya"]
+        assert list_reference_values(conn, "supplier") == ["Unificat"]
+        for table in ("prepared_mixtures", "packaged_products"):
+            saved = json.loads(conn.execute(f"SELECT ingredients_json FROM {table}").fetchone()[0])
+            assert saved[0]["ingredients"][0] == {"provenance": "Espanya", "supplier": "Unificat", "supplier_lot": "España"}
+        assert conn.execute("SELECT provenance FROM packaged_products").fetchone()[0] == "Espanya"
+        with pytest.raises(ValueError):
+            rename_reference_value(conn, "name", "Mix", "Other")
+    finally:
+        conn.close()
+
+
 def test_generate_packed_lot_format():
     lot = generate_packed_lot("P1")
     assert lot.startswith("P1-")
