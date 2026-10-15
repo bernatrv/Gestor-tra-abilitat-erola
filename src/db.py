@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import sqlite3
-import uuid
-from datetime import datetime
+import unicodedata
+from datetime import date, datetime
+from difflib import SequenceMatcher
+
+from src.core import generate_barcode_from_sku, parse_date
 
 DB_PATH = os.path.join("data", "trazabilitat.db")
 
@@ -166,6 +170,64 @@ def create_session(conn: sqlite3.Connection, notes: str = "") -> int:
     return int(cursor.lastrowid)
 
 
+def list_sessions(conn: sqlite3.Connection):
+    return conn.execute("SELECT * FROM sessions ORDER BY started_at DESC, id DESC").fetchall()
+
+
+def list_session_packaged_products(conn: sqlite3.Connection, session_id: int, term: str = ""):
+    return list_history_packaged_products(conn, term=term, session_id=session_id)
+
+
+def list_history_packaged_products(conn: sqlite3.Connection, term: str = "", session_id: int | None = None):
+    rows = conn.execute(
+        "SELECT p.*, s.started_at AS session_started_at FROM packaged_products p "
+        "LEFT JOIN sessions s ON s.id = p.session_id WHERE (? IS NULL OR p.session_id = ?) "
+        "ORDER BY s.started_at DESC, p.session_id DESC, p.created_at DESC, p.id DESC",
+        (session_id, session_id),
+    ).fetchall()
+    query = _suggestion_key(term)
+    columns = ("name", "packed_lot", "supplier_lot", "provenance", "expiry", "created_at")
+    return [row for row in rows if not query or any(query in _suggestion_key(row[column]) for column in columns)]
+
+
+def search_history_suggestions(conn: sqlite3.Connection, term: str, session_id: int | None = None, limit: int = 8):
+    if not _suggestion_key(term):
+        return []
+    candidates = []
+    seen = set()
+    for row in list_history_packaged_products(conn, session_id=session_id):
+        for column in ("name", "packed_lot", "supplier_lot", "provenance", "expiry", "created_at"):
+            value = row[column]
+            key = _suggestion_key(value)
+            if key and key not in seen:
+                seen.add(key)
+                candidates.append({"value": value})
+    matches = [row["value"] for row in _rank_suggestions(candidates, term, ("value",), limit)]
+    query = _suggestion_key(term)
+    if len(matches) >= limit or len(query) < 3 or query.isdecimal():
+        return matches
+    approximate = []
+    compact_query = query.replace(" ", "")
+    word_count = len(query.split())
+    for index, candidate in enumerate(candidates):
+        value = candidate["value"]
+        if value in matches:
+            continue
+        normalized = _suggestion_key(value)
+        words = normalized.split()
+        variants = [normalized.replace(" ", "")]
+        variants.extend(
+            "".join(words[start:start + count])
+            for count in range(max(1, word_count - 1), word_count + 2)
+            for start in range(len(words))
+        )
+        similarity = max(SequenceMatcher(None, compact_query, variant).ratio() for variant in variants)
+        if similarity >= 0.66:
+            approximate.append((-similarity, index, value))
+    approximate.sort()
+    return matches + [value for score, index, value in approximate[:limit - len(matches)]]
+
+
 def add_raw_material(
     conn: sqlite3.Connection,
     name: str,
@@ -186,6 +248,35 @@ def add_raw_material(
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def update_raw_material(
+    conn: sqlite3.Connection,
+    material_id: int,
+    name: str,
+    supplier: str,
+    supplier_lot: str,
+    provenance: str,
+    expiry: str,
+    *,
+    barcode: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    with conn:
+        if barcode is not None:
+            if not barcode.strip():
+                raise ValueError("Cal indicar el codi de barres.")
+            if conn.execute(
+                "SELECT id FROM raw_materials WHERE barcode = ? AND id <> ? "
+                "UNION ALL SELECT id FROM prepared_mixtures WHERE barcode = ?",
+                (barcode, material_id, barcode),
+            ).fetchone():
+                raise ValueError("Ja existeix una recepció o barreja amb aquest codi de barres.")
+        conn.execute(
+            "UPDATE raw_materials SET name = ?, supplier = ?, supplier_lot = ?, provenance = ?, expiry = ?, "
+            "barcode = COALESCE(?, barcode), created_at = COALESCE(?, created_at) WHERE id = ?",
+            (name, supplier, supplier_lot, provenance, expiry, barcode, created_at, material_id),
+        )
 
 
 def add_packaged_product(
@@ -241,17 +332,93 @@ def count_packed_lots_for_sku_on_date(conn: sqlite3.Connection, sku: str, date_s
     return int(row["total"]) if row else 0
 
 
+def next_inventory_barcode(conn, sku, reference_date: date | None = None):
+    reference_date = reference_date or date.today()
+    sku = sku or ""
+    prefix = f"{reference_date.strftime('%Y%m%d')}{sku}"
+    rows = conn.execute(
+        "SELECT barcode FROM raw_materials WHERE substr(barcode, 1, ?) = ? AND length(barcode) = ? "
+        "UNION ALL SELECT barcode FROM prepared_mixtures WHERE substr(barcode, 1, ?) = ? AND length(barcode) = ?",
+        (len(prefix), prefix, len(prefix) + 2, len(prefix), prefix, len(prefix) + 2),
+    ).fetchall()
+    sequence = max((int(row["barcode"][-2:]) for row in rows if row["barcode"][-2:].isdigit()), default=0) + 1
+    if sequence > 99:
+        raise ValueError("Ja s'han utilitzat els 99 codis de barres disponibles avui per a aquest SKU.")
+    return generate_barcode_from_sku(sku, reference_date=reference_date, sequence=sequence)
+
+
 def add_prepared_mixture(conn, name, sku, lot, expiry, ingredients):
+    created_at = datetime.now()
+    barcode = next_inventory_barcode(conn, sku, created_at.date())
     cursor = conn.execute(
         """
         INSERT INTO prepared_mixtures (name, sku, lot, expiry, barcode, created_at, ingredients_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, sku or "", lot, expiry, f"MIX-{uuid.uuid4().hex}",
-         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), json.dumps(ingredients)),
+        (name, sku or "", lot, expiry, barcode,
+         created_at.strftime("%Y-%m-%d %H:%M:%S"), json.dumps(ingredients)),
     )
     conn.commit()
     return conn.execute("SELECT * FROM prepared_mixtures WHERE id = ?", (cursor.lastrowid,)).fetchone()
+
+
+def update_prepared_mixture(conn, mixture_id, lot, expiry, barcode, created_at, ingredients):
+    if not lot.strip() or not barcode.strip():
+        raise ValueError("Cal indicar el lot de sortida i el codi de barres.")
+    expiry_date = parse_date(expiry)
+    if expiry_date is None:
+        raise ValueError("Cal indicar el consum preferent.")
+    try:
+        produced_at = datetime.strptime(created_at.strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        produced_date = parse_date(created_at)
+        if produced_date is None:
+            raise ValueError("Cal indicar la data de producció.")
+        produced_at = datetime.combine(produced_date, datetime.min.time())
+
+    def clean_ingredients(items):
+        if not isinstance(items, list) or not items:
+            raise ValueError("Cal indicar almenys un ingredient.")
+        cleaned = []
+        for item in items:
+            if not isinstance(item, dict) or not (str(item.get("name") or "").strip() or str(item.get("sku") or "").strip()):
+                raise ValueError("Cada ingredient ha de tenir nom o SKU.")
+            ingredient = dict(item)
+            ingredient_expiry = parse_date(ingredient.get("expiry"))
+            ingredient["expiry"] = ingredient_expiry.isoformat() if ingredient_expiry else ""
+            if str(ingredient.get("created_at") or "").strip():
+                try:
+                    received_at = datetime.strptime(ingredient["created_at"].strip(), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    received_at = datetime.combine(parse_date(ingredient["created_at"]), datetime.min.time())
+                ingredient["created_at"] = received_at.strftime("%Y-%m-%d %H:%M:%S")
+            elif "created_at" in ingredient:
+                ingredient["created_at"] = ""
+            if ingredient.get("quantity") not in (None, ""):
+                quantity = float(str(ingredient["quantity"]).replace(",", "."))
+                if not math.isfinite(quantity) or quantity < 0:
+                    raise ValueError("La quantitat d'un ingredient ha de ser un número finit no negatiu.")
+                ingredient["quantity"] = quantity
+            elif "quantity" in ingredient:
+                ingredient["quantity"] = None
+            if ingredient.get("ingredients"):
+                ingredient["ingredients"] = clean_ingredients(ingredient["ingredients"])
+            cleaned.append(ingredient)
+        return cleaned
+
+    ingredients = clean_ingredients(ingredients)
+    with conn:
+        if conn.execute(
+            "SELECT id FROM prepared_mixtures WHERE barcode = ? AND id <> ? "
+            "UNION ALL SELECT id FROM raw_materials WHERE barcode = ?",
+            (barcode.strip(), mixture_id, barcode.strip()),
+        ).fetchone():
+            raise ValueError("Ja existeix una recepció o preparació amb aquest codi de barres.")
+        conn.execute(
+            "UPDATE prepared_mixtures SET lot = ?, expiry = ?, barcode = ?, created_at = ?, ingredients_json = ? WHERE id = ?",
+            (lot.strip(), expiry_date.isoformat(), barcode.strip(), produced_at.strftime("%Y-%m-%d %H:%M:%S"),
+             json.dumps(ingredients), mixture_id),
+        )
 
 
 def list_prepared_mixtures(conn):
@@ -269,10 +436,49 @@ def get_packaging_ingredient_by_barcode(conn, barcode):
     return mixture if mixture is not None else get_material_by_barcode(conn, barcode)
 
 
+def _suggestion_key(value):
+    return " ".join("".join(
+        character for character in unicodedata.normalize("NFD", str(value or "").casefold())
+        if not unicodedata.combining(character)
+    ).split())
+
+
+def _rank_suggestions(rows, term, columns, limit):
+    query = _suggestion_key(term)
+    if not query:
+        return []
+    ranked = []
+    for index, row in enumerate(rows):
+        best = (4, 0.0)
+        for column in columns:
+            value = _suggestion_key(row[column])
+            if not value:
+                continue
+            if value == query:
+                score = (0, 0.0)
+            elif value.startswith(query):
+                score = (1, 0.0)
+            elif query in value:
+                score = (2, 0.0)
+            elif len(query) >= 4 and not query.isdecimal() and column != "sku":
+                words = value.split()
+                window = len(query.split())
+                candidates = [value] + [" ".join(words[start:start + window]) for start in range(len(words))]
+                similarity = max(SequenceMatcher(None, query, candidate).ratio() for candidate in candidates)
+                score = (3, -similarity) if similarity >= 0.78 else (4, 0.0)
+            else:
+                score = (4, 0.0)
+            best = min(best, score)
+        if best[0] < 4:
+            ranked.append((best, index, row))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [row for score, index, row in ranked[:limit]]
+
+
 def search_packaging_ingredients(conn, term, limit=8):
     if not term:
         return []
-    return conn.execute(
+    rows = conn.execute(
         """
         WITH available AS (
             SELECT rm.name, rm.supplier_lot, rm.provenance, rm.supplier, rm.expiry, rm.barcode, rm.created_at,
@@ -285,10 +491,10 @@ def search_packaging_ingredients(conn, term, limit=8):
             SELECT name, lot, '', '', expiry, barcode, created_at, sku, id, ingredients_json
             FROM prepared_mixtures
         )
-        SELECT * FROM available WHERE LOWER(name) LIKE LOWER(?) OR LOWER(sku) LIKE LOWER(?)
-        ORDER BY created_at DESC LIMIT ?
-        """, (f"{term}%", f"{term}%", limit),
+        SELECT * FROM available ORDER BY created_at DESC
+        """,
     ).fetchall()
+    return _rank_suggestions(rows, term, ("name", "sku"), limit)
 
 
 def upsert_catalog_rows(conn: sqlite3.Connection, rows: list[dict], source_file: str) -> int:
@@ -461,7 +667,7 @@ _ALLOWED_SUGGESTION_COLUMNS = {"supplier", "provenance"}
 
 
 def search_distinct_raw_material_values(conn: sqlite3.Connection, column: str, term: str, limit: int = 8):
-    """Retorna valors distints ja introduïts anteriorment a `raw_materials.<column>` que comencen per `term`.
+    """Retorna valors distints similars al text, ignorant accents i acceptant fragments.
 
     Només s'accepten les columnes de `_ALLOWED_SUGGESTION_COLUMNS` per evitar interpolar noms de columna
     arbitraris a la consulta SQL.
@@ -470,16 +676,16 @@ def search_distinct_raw_material_values(conn: sqlite3.Connection, column: str, t
         raise ValueError(f"Columna no permesa per a suggeriments: {column}")
     if not term:
         return []
-    like_term = f"{term}%"
     query = (
         f"SELECT DISTINCT {column} AS value FROM raw_materials "
-        f"WHERE {column} IS NOT NULL AND TRIM({column}) != '' AND LOWER({column}) LIKE LOWER(?) "
-        f"ORDER BY {column} COLLATE NOCASE LIMIT ?"
+        f"WHERE {column} IS NOT NULL AND TRIM({column}) != '' "
+        f"ORDER BY {column} COLLATE NOCASE"
     )
-    return [row["value"] for row in conn.execute(query, (like_term, limit)).fetchall()]
+    rows = conn.execute(query).fetchall()
+    return [row["value"] for row in _rank_suggestions(rows, term, ("value",), limit)]
 
 def search_received_materials(conn: sqlite3.Connection, term: str, limit: int = 8):
-    """Retorna files concretes de `raw_materials` el nom o SKU de les quals comença per `term`.
+    """Retorna lots rebuts amb nom o SKU similar al text de cerca.
 
     A diferència de `search_distinct_raw_material_values`, aquí es retorna cada lot rebut
     individualment (amb el seu propi codi de barres, lot, caducitat i data d'entrada), ja
@@ -487,8 +693,7 @@ def search_received_materials(conn: sqlite3.Connection, term: str, limit: int = 
     """
     if not term:
         return []
-    like_term = f"{term}%"
-    return conn.execute(
+    rows = conn.execute(
         """
         WITH enriched AS (
             SELECT rm.name AS name, rm.supplier_lot AS supplier_lot, rm.provenance AS provenance,
@@ -501,38 +706,33 @@ def search_received_materials(conn: sqlite3.Connection, term: str, limit: int = 
             FROM raw_materials rm
         )
         SELECT * FROM enriched
-        WHERE LOWER(name) LIKE LOWER(?) OR LOWER(sku) LIKE LOWER(?)
         ORDER BY created_at DESC
-        LIMIT ?
         """,
-        (like_term, like_term, limit),
     ).fetchall()
+    return _rank_suggestions(rows, term, ("name", "sku"), limit)
 
 
 def search_catalog_products(conn: sqlite3.Connection, term: str, limit: int = 8):
-    """Retorna productes del cat\u00e0leg el nom o SKU dels quals comen\u00e7a per `term`.
+    """Retorna productes amb nom o SKU similar al text, ignorant accents.
 
     Nom\u00e9s es retorna l'entrada m\u00e9s recent per a cada nom (per si s'ha importat m\u00e9s d'un cop).
     """
     if not term:
         return []
-    like_term = f"{term}%"
-    return conn.execute(
+    rows = conn.execute(
         """
         SELECT p.name AS name, p.sku AS sku
         FROM product_catalog p
-        WHERE (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.sku) LIKE LOWER(?))
-          AND p.id = (
+                WHERE p.id = (
               SELECT id FROM product_catalog p2
               WHERE LOWER(TRIM(p2.name)) = LOWER(TRIM(p.name))
               ORDER BY created_at DESC, id DESC
               LIMIT 1
           )
         ORDER BY p.name COLLATE NOCASE
-        LIMIT ?
         """,
-        (like_term, like_term, limit),
     ).fetchall()
+    return _rank_suggestions(rows, term, ("name", "sku"), limit)
 
 
 def list_raw_materials(conn: sqlite3.Connection):
@@ -543,7 +743,8 @@ def list_raw_materials(conn: sqlite3.Connection):
 
 def list_packaged_products(conn: sqlite3.Connection):
     return conn.execute(
-        "SELECT * FROM packaged_products ORDER BY created_at DESC"
+        "SELECT p.*, m.barcode AS prepared_mixture_barcode FROM packaged_products p "
+        "LEFT JOIN prepared_mixtures m ON m.id = p.prepared_mixture_id ORDER BY p.created_at DESC"
     ).fetchall()
 
 
@@ -593,6 +794,17 @@ def upsert_recipe(
     ingredients: list[dict],
     recipe_id: int | None = None,
 ) -> int:
+    with conn:
+        return _upsert_recipe(conn, sku, name, ingredients, recipe_id)
+
+
+def _upsert_recipe(
+    conn: sqlite3.Connection,
+    sku: str,
+    name: str,
+    ingredients: list[dict],
+    recipe_id: int | None = None,
+) -> int:
     """Insereix una recepta nova o actualitza'n una existent (per `recipe_id` o, si no, pel SKU).
 
     `ingredients` és una llista de diccionaris amb `sku`, `name` i `quantity`. En actualitzar, es
@@ -622,8 +834,101 @@ def upsert_recipe(
             "INSERT INTO recipe_ingredients (recipe_id, sku, name, quantity) VALUES (?, ?, ?, ?)",
             (recipe_id, item.get("sku") or "", item.get("name", ""), item.get("quantity")),
         )
-    conn.commit()
     return recipe_id
+
+
+def validate_recipes_data(payload) -> list[dict]:
+    if isinstance(payload, dict):
+        if payload.get("format", "erola.recipes") != "erola.recipes" or payload.get("version", 1) != 1:
+            raise ValueError("Format o versió de receptes no compatible.")
+        payload = payload.get("recipes")
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("El fitxer ha de contenir una llista de receptes no buida.")
+    result = []
+    seen = set()
+    for index, recipe in enumerate(payload, start=1):
+        if not isinstance(recipe, dict):
+            raise ValueError(f"La recepta {index} no és un objecte JSON.")
+        name = recipe.get("name")
+        sku = recipe.get("sku", "")
+        if sku is None:
+            sku = ""
+        if not isinstance(name, str) or not name.strip() or not isinstance(sku, str):
+            raise ValueError(f"Nom o SKU no vàlid a la recepta {index}. L'SKU ha de ser text.")
+        name, sku = name.strip(), sku.strip()
+        key = ("sku", sku) if sku else ("name", name.casefold())
+        if key in seen:
+            raise ValueError(f"Recepta duplicada al fitxer: {name} ({sku}).")
+        seen.add(key)
+        ingredients = recipe.get("ingredients")
+        if not isinstance(ingredients, list) or not ingredients:
+            raise ValueError(f"La recepta '{name}' ha de tenir almenys un ingredient.")
+        cleaned = []
+        for ingredient in ingredients:
+            if not isinstance(ingredient, dict):
+                raise ValueError(f"Ingredient no vàlid a '{name}'.")
+            ing_name = ingredient.get("name", "")
+            ing_sku = ingredient.get("sku", "")
+            if ing_name is None:
+                ing_name = ""
+            if ing_sku is None:
+                ing_sku = ""
+            if not isinstance(ing_name, str) or not isinstance(ing_sku, str) or not (ing_name.strip() or ing_sku.strip()):
+                raise ValueError(f"Cada ingredient de '{name}' ha de tenir nom o SKU de text.")
+            quantity = ingredient.get("quantity")
+            if quantity is not None:
+                if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+                    raise ValueError(f"Quantitat no vàlida a '{name}': cal un número o null.")
+                try:
+                    quantity = float(quantity)
+                except OverflowError as exc:
+                    raise ValueError(f"Quantitat massa gran a '{name}'.") from exc
+                if not math.isfinite(quantity):
+                    raise ValueError(f"Quantitat no vàlida a '{name}': cal un número finit.")
+            cleaned.append({"name": ing_name.strip(), "sku": ing_sku.strip(), "quantity": quantity})
+        result.append({"name": name, "sku": sku, "ingredients": cleaned})
+    return result
+
+
+def read_recipes_json(target_path: str) -> list[dict]:
+    with open(target_path, encoding="utf-8-sig") as source:
+        return validate_recipes_data(json.load(source))
+
+
+def export_recipes_json(conn: sqlite3.Connection, target_path: str, recipe_ids: list[int] | None = None) -> int:
+    ids = recipe_ids if recipe_ids is not None else [row["id"] for row in list_recipes(conn)]
+    recipes = []
+    for recipe_id in ids:
+        data = get_recipe_by_id(conn, recipe_id)
+        if data is None:
+            raise ValueError(f"La recepta {recipe_id} ja no existeix.")
+        recipe = data["recipe"]
+        recipes.append({
+            "sku": recipe["sku"] or "", "name": recipe["name"],
+            "ingredients": [
+                {"sku": row["sku"] or "", "name": row["name"], "quantity": row["quantity"]}
+                for row in data["ingredients"]
+            ],
+        })
+    if not recipes:
+        raise ValueError("No hi ha receptes per exportar.")
+    with open(target_path, "w", encoding="utf-8") as target:
+        json.dump({"format": "erola.recipes", "version": 1, "recipes": recipes}, target,
+                  ensure_ascii=False, indent=2, allow_nan=False)
+        target.write("\n")
+    return len(recipes)
+
+
+def import_recipes(conn: sqlite3.Connection, recipes: list[dict]) -> int:
+    recipes = validate_recipes_data(recipes)
+    with conn:
+        for recipe in recipes:
+            recipe_id = None
+            if not recipe["sku"]:
+                existing = conn.execute("SELECT id, name FROM recipes WHERE COALESCE(sku, '') = ''").fetchall()
+                recipe_id = next((row["id"] for row in existing if row["name"].casefold() == recipe["name"].casefold()), None)
+            _upsert_recipe(conn, recipe["sku"], recipe["name"], recipe["ingredients"], recipe_id)
+    return len(recipes)
 
 
 def list_recipes(conn: sqlite3.Connection):

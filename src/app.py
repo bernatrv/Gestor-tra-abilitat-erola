@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import json
 import os
 import sqlite3
@@ -9,12 +10,12 @@ import tkinter.font as tkfont
 import unicodedata
 import zlib
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from src.core import (
     compute_expiry_from_ingredients,
-    generate_barcode_from_sku,
     generate_daily_sequential_lot,
     generate_packed_lot,
     ingredient_matches_recipe_ingredients,
@@ -29,8 +30,8 @@ from src.db import (
     add_packaged_product,
     add_prepared_mixture,
     add_raw_material,
-    count_barcodes_with_prefix,
     count_packed_lots_for_sku_on_date,
+    export_recipes_json,
     export_session_csv,
     get_catalog_edit_counts,
     get_catalog_row_by_name,
@@ -43,6 +44,7 @@ from src.db import (
     get_recipe_by_sku,
     get_setting,
     initialize_db,
+    import_recipes,
     create_session,
     list_catalog_products,
     list_edited_catalog_products,
@@ -51,28 +53,41 @@ from src.db import (
     list_raw_materials,
     list_recipes,
     list_recipes_with_ingredients,
+    list_sessions,
+    list_history_packaged_products,
+    next_inventory_barcode,
+    read_recipes_json,
     revert_all_catalog_edits,
     revert_catalog_row,
     replace_catalog_rows,
     search_catalog_products,
     search_distinct_raw_material_values,
-    search_packaged,
+    search_history_suggestions,
     search_packaging_ingredients,
     set_setting,
     update_catalog_field,
+    update_raw_material,
+    update_prepared_mixture,
     upsert_recipe,
+    validate_recipes_data,
 )
-from src.label_print import create_label_image, create_mixture_label_image, print_label_file
+from src.label_print import create_label_image, create_mixture_label_image, create_packaged_label_image, print_label_file
 
 _CATALOG_COLUMNS = ("SKU", "Nom", "Pes", "Categoria")
 _CATALOG_EDITABLE_COLUMNS = ("SKU", "Nom", "Pes")
 _CATALOG_FIELD_BY_COLUMN = {"SKU": "sku", "Nom": "name", "Pes": "weight"}
+APP_NAME = "erola producció"
 
 
 class TraceabilityApp(tk.Tk):
     def __init__(self):
+        if os.name == "nt":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Erola.Produccio")
         super().__init__()
-        self.title("Gestor de traçabilitat Erola")
+        icon_path = Path(__file__).resolve().parent.parent / "icon" / "erola-traçabilitat_ICON.png"
+        self._application_icon = tk.PhotoImage(master=self, file=str(icon_path))
+        self.iconphoto(True, self._application_icon)
+        self.title(APP_NAME)
         self.geometry("1200x760")
         self.minsize(1000, 650)
         self.printer_name = "Epson ColorWorks CW-C4000e"
@@ -81,6 +96,7 @@ class TraceabilityApp(tk.Tk):
         self.package_final_product_auto = True
         self.package_reuse_lot: str | None = None
         self.package_prepared_mixture_id: int | None = None
+        self.package_mixture_modified = False
         self.suggestions_window: tk.Toplevel | None = None
         self.suggestions_listbox: tk.Listbox | None = None
         self.suggestions_items: list = []
@@ -99,6 +115,7 @@ class TraceabilityApp(tk.Tk):
         self.current_recipe_product_name = ""
         self._recipe_search_matches: list[str] = []
         self._recipe_search_index = -1
+        self.selected_session_id: int | None = None
         self.conn: sqlite3.Connection | None = None
         self.db_path = DB_PATH
         self.history = ActionHistory()
@@ -106,6 +123,7 @@ class TraceabilityApp(tk.Tk):
         self._db_snapshot_cache: tuple[int, bytes] | None = None
         self.history_window: tk.Toplevel | None = None
         self.actions_tree: ttk.Treeview | None = None
+        self._install_input_focus_highlight()
         self._install_entry_shortcuts()
         self.build_menu()
         self.build_ui()
@@ -135,6 +153,7 @@ class TraceabilityApp(tk.Tk):
         self.conn = new_conn
         self.db_path = path
         self.session_id = create_session(self.conn)
+        self.selected_session_id = self.session_id
         self.history.clear()
         self._db_snapshot_cache = None
         self._refresh_history_view()
@@ -143,7 +162,7 @@ class TraceabilityApp(tk.Tk):
                 old_conn.close()
             except Exception:
                 pass
-        self.title(f"Gestor de traçabilitat Erola — {os.path.basename(path)}")
+        self.title(f"{APP_NAME} — {os.path.basename(path)}")
         self.refresh_materials()
         self.refresh_history()
         self.populate_package_history()
@@ -252,6 +271,40 @@ class TraceabilityApp(tk.Tk):
         tabs = self.notebook.tabs()
         if 0 <= index < len(tabs):
             self.notebook.select(tabs[index])
+
+    def _install_input_focus_highlight(self):
+        self._input_focus_color = "#fff2b3"
+        style = ttk.Style(self)
+        style.element_create("FocusedInput.field", "from", "clam", "Entry.field")
+        style.layout("FocusedInput.TEntry", [
+            ("FocusedInput.field", {"sticky": "nswe", "children": [
+                ("Entry.padding", {"sticky": "nswe", "children": [("Entry.textarea", {"sticky": "nswe"})]}),
+            ]}),
+        ])
+        style.configure("FocusedInput.TEntry", fieldbackground=self._input_focus_color, foreground="#111111")
+        for widget_class in ("Entry", "TEntry", "Text", "Spinbox"):
+            self.bind_class(widget_class, "<FocusIn>", self._highlight_input_focus, add="+")
+            self.bind_class(widget_class, "<FocusOut>", self._restore_input_background, add="+")
+
+    def _highlight_input_focus(self, event):
+        widget = event.widget
+        if not isinstance(widget, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox)) or not self._entry_is_editable(widget):
+            return
+        if hasattr(widget, "_unfocused_input_appearance"):
+            return
+        option = "style" if isinstance(widget, ttk.Entry) else "background"
+        widget._unfocused_input_appearance = (option, widget.cget(option))
+        widget.configure(**{option: "FocusedInput.TEntry" if option == "style" else self._input_focus_color})
+
+    def _restore_input_background(self, event):
+        widget = event.widget
+        appearance = getattr(widget, "_unfocused_input_appearance", None)
+        if appearance is not None:
+            del widget._unfocused_input_appearance
+            try:
+                widget.configure(**{appearance[0]: appearance[1]})
+            except tk.TclError:
+                pass
 
     def _install_entry_shortcuts(self):
         """Dreceres d'edició de text habituals a Windows que Tk no porta per als quadres de text."""
@@ -473,7 +526,7 @@ class TraceabilityApp(tk.Tk):
 
         tk.Label(frame, text="Últims productes rebuts", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w", padx=10, pady=(10, 4), columnspan=11)
         self.received_tree = ttk.Treeview(
-            frame, columns=("Nom", "Proveïdor", "SKU", "Lot", "Origen", "Caducitat", "Codi", "Data"), show="headings"
+            frame, columns=("Nom", "Proveïdor", "SKU", "Lot", "Origen", "Caducitat", "Codi", "Data", "Etiqueta"), show="headings"
         )
         for text in ("Nom", "Proveïdor", "SKU", "Lot", "Origen", "Caducitat", "Codi", "Data"):
             self.received_tree.heading(text, text=text)
@@ -481,7 +534,133 @@ class TraceabilityApp(tk.Tk):
         self.received_tree.grid(row=4, column=0, columnspan=11, padx=10, pady=(4, 8), sticky="nsew")
         self._attach_scrollbars(self.received_tree, horizontal=True)
         self._setup_sortable_tree(self.received_tree)
+        self.received_tree.column("Etiqueta", width=28, minwidth=28, stretch=False)
+        self.received_tree.heading("Etiqueta", text="", command="")
+        ttk.Style(self).configure("ReceiptPrint.TButton", font=("Segoe UI Symbol", 9), padding=0)
+        self._received_print_buttons = {}
+        self._received_print_tooltip = None
+        for axis in ("x", "y"):
+            scroll_command = self.received_tree.cget(f"{axis}scrollcommand")
+
+            def on_scroll(first, last, command=scroll_command):
+                self.received_tree.tk.call(command, first, last)
+                self.after_idle(self._position_received_print_buttons)
+
+            self.received_tree.configure(**{f"{axis}scrollcommand": on_scroll})
+        self.received_tree.bind("<Configure>", lambda event: self.after_idle(self._position_received_print_buttons))
+        self.received_tree.bind("<ButtonRelease-1>", lambda event: self.after_idle(self._position_received_print_buttons))
+        self.received_tree.bind("<Double-1>", self._on_received_double_click)
         frame.grid_rowconfigure(4, weight=1)
+
+    def _position_received_print_buttons(self):
+        tree = self.received_tree
+        for iid, button in self._received_print_buttons.items():
+            bounds = tree.bbox(iid, "Etiqueta")
+            if bounds and bounds[0] >= 0 and bounds[0] + bounds[2] <= tree.winfo_width():
+                left, top, width, height = bounds
+                size = min(width - 4, height - 2)
+                button.place(x=left + (width - size) // 2, y=top + 1, width=size, height=size)
+            else:
+                button.place_forget()
+
+    def _show_received_print_tooltip(self, event):
+        self._hide_received_print_tooltip()
+        tooltip = tk.Toplevel(self.received_tree)
+        tooltip.overrideredirect(True)
+        tooltip.geometry(f"+{event.widget.winfo_rootx()}+{event.widget.winfo_rooty() + event.widget.winfo_height() + 4}")
+        tk.Label(tooltip, text="Imprimir l'etiqueta de recepció", relief="solid", borderwidth=1, padx=5, pady=2).pack()
+        self._received_print_tooltip = tooltip
+
+    def _hide_received_print_tooltip(self, event=None):
+        if self._received_print_tooltip is not None:
+            self._received_print_tooltip.destroy()
+            self._received_print_tooltip = None
+
+    def _print_received_material(self, material, parent=None):
+        try:
+            path = create_label_image(
+                material["name"], material["supplier_lot"], material["provenance"],
+                material["expiry"], material["barcode"], supplier=material["supplier"],
+            )
+            result = print_label_file(path, self.printer_name)
+            if result.get("status") != "printed":
+                messagebox.showwarning("Etiqueta no impresa", result.get("message", ""), parent=parent or self)
+        except Exception as exc:
+            messagebox.showwarning("Etiqueta no impresa", str(exc), parent=parent or self)
+
+    def _on_received_double_click(self, event):
+        iid = self.received_tree.identify_row(event.y)
+        if iid:
+            self._open_received_editor(int(iid))
+
+    def _open_received_editor(self, material_id):
+        row = self.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone()
+        if row is None:
+            return
+        material = dict(row)
+        dialog = tk.Toplevel(self)
+        dialog.title("Modificar recepció")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        fields = {}
+        for index, (key, label) in enumerate((
+            ("name", "Nom"), ("supplier", "Proveïdor"), ("supplier_lot", "Lot"),
+            ("provenance", "Origen"), ("expiry", "Caducitat"),
+            ("barcode", "Codi de barres"), ("created_at", "Data de recepció"),
+        )):
+            tk.Label(dialog, text=label).grid(row=index, column=0, sticky="w", padx=12, pady=6)
+            entry = tk.Entry(dialog, width=48, name=key)
+            entry.insert(0, material[key] or "")
+            entry.grid(row=index, column=1, sticky="ew", padx=(0, 12), pady=6)
+            fields[key] = entry
+        def values():
+            edited = {key: entry.get().strip() for key, entry in fields.items()}
+            if not edited["name"]:
+                raise ValueError("Cal indicar el nom.")
+            if not edited["barcode"]:
+                raise ValueError("Cal indicar el codi de barres.")
+            expiry = parse_date(edited["expiry"])
+            edited["expiry"] = expiry.isoformat() if expiry else ""
+            try:
+                received_at = datetime.strptime(edited["created_at"], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                received_date = parse_date(edited["created_at"])
+                if received_date is None:
+                    raise ValueError("Cal indicar la data de recepció.")
+                received_at = datetime.combine(received_date, datetime.min.time())
+            edited["created_at"] = received_at.strftime("%Y-%m-%d %H:%M:%S")
+            return {**material, **edited}
+
+        def save():
+            try:
+                edited = values()
+                with self._action(f"Recepció: modificar '{edited['name']}'"):
+                    update_raw_material(
+                        self.conn, material_id, edited["name"], edited["supplier"], edited["supplier_lot"],
+                        edited["provenance"], edited["expiry"], barcode=edited["barcode"], created_at=edited["created_at"],
+                    )
+            except (ValueError, sqlite3.Error) as exc:
+                messagebox.showerror("Recepció no guardada", str(exc), parent=dialog)
+                return
+            self.refresh_materials()
+            dialog.destroy()
+
+        def print_current():
+            try:
+                edited = values()
+            except ValueError as exc:
+                messagebox.showerror("Dades incorrectes", str(exc), parent=dialog)
+                return
+            self._print_received_material(edited, parent=dialog)
+
+        buttons = tk.Frame(dialog)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", padx=12, pady=12)
+        ttk.Button(buttons, text="Guardar", command=save).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Cancel·lar", command=dialog.destroy).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Imprimir", command=print_current).pack(side="left", padx=4)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        fields["name"].focus_set()
 
     def _advance_received_field(self, event):
         self._hide_suggestions()
@@ -685,11 +864,11 @@ class TraceabilityApp(tk.Tk):
         )
         self.package_history_tree = ttk.Treeview(
             history_frame,
-            columns=("Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data"),
+            columns=("Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data", "Codi barreja"),
             show="headings",
             height=10,
         )
-        for text in ("Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data"):
+        for text in ("Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data", "Codi barreja"):
             self.package_history_tree.heading(text, text=text)
             self.package_history_tree.column(text, width=150)
         self.package_history_tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
@@ -1133,9 +1312,17 @@ class TraceabilityApp(tk.Tk):
             self._add_package_ingredient_impl(material)
 
     def _add_package_ingredient_impl(self, material):
+        material = dict(material)
+        if material.get("mixture_id") and not self.package_ingredients:
+            self._load_packaged_product_into_form_impl({
+                **material, "packed_lot": material["supplier_lot"], "prepared_mixture_id": material["mixture_id"],
+            })
+            self.package_ingredient_entry.delete(0, tk.END)
+            return
+        if self.package_prepared_mixture_id is not None:
+            self.package_mixture_modified = True
         self.package_reuse_lot = None
         self.package_prepared_mixture_id = None
-        material = dict(material)
         try:
             sku = material["sku"]
         except (IndexError, KeyError):
@@ -1442,10 +1629,14 @@ class TraceabilityApp(tk.Tk):
             packed_lot = generate_daily_sequential_lot(sequence)
         barcode = packed_lot
 
-        if len(self.package_ingredients) > 1 and not self.package_reuse_lot:
-            mixture = add_prepared_mixture(
-                self.conn, product_name, sku_value, packed_lot, str(expiry_date), self.package_ingredients,
-            )
+        if (len(self.package_ingredients) > 1 or self.package_mixture_modified) and not self.package_reuse_lot:
+            try:
+                mixture = add_prepared_mixture(
+                    self.conn, product_name, sku_value, packed_lot, str(expiry_date), self.package_ingredients,
+                )
+            except ValueError as exc:
+                messagebox.showerror("Barreja no guardada", str(exc))
+                return "break"
             self.populate_prepared_mixture_history()
             if messagebox.askyesno("Etiqueta de barreja", "Vols imprimir l'etiqueta de traçabilitat de la barreja sense envasar?"):
                 try:
@@ -1456,6 +1647,8 @@ class TraceabilityApp(tk.Tk):
                     result = print_label_file(label_path, self.printer_name)
                     if result["status"] == "error":
                         raise RuntimeError(result["message"])
+                    if result["status"] == "skipped":
+                        messagebox.showwarning("Full de recepta desat", result["message"])
                 except Exception as exc:
                     messagebox.showwarning("Barreja guardada", f"La barreja s'ha guardat, però no s'ha pogut imprimir l'etiqueta:\n{exc}")
             if quantity:
@@ -1483,11 +1676,11 @@ class TraceabilityApp(tk.Tk):
         self.populate_package_history()
         self.refresh_history()
         try:
-            label_path = create_label_image(
-                product_name, packed_lot, provenance, str(expiry_date), barcode,
-                weight=f"{weight} kg" if weight else None,
-            )
-            for label_index in range(quantity or 1):
+            label_paths = [
+                create_packaged_label_image(product_name, packed_lot, provenance, str(expiry_date))
+                for label_index in range(quantity or 1)
+            ]
+            for label_path in label_paths:
                 result = print_label_file(label_path, self.printer_name)
                 if result["status"] == "error":
                     raise RuntimeError(result["message"])
@@ -1509,11 +1702,11 @@ class TraceabilityApp(tk.Tk):
         self.populate_package_history()
         self.refresh_history()
         try:
-            label_path = create_label_image(
-                mixture["name"], mixture["lot"], "", mixture["expiry"], mixture["lot"],
-                weight=f"{weight} kg" if weight else None,
-            )
-            for label_index in range(quantity):
+            label_paths = [
+                create_packaged_label_image(mixture["name"], mixture["lot"], "", mixture["expiry"])
+                for label_index in range(quantity)
+            ]
+            for label_path in label_paths:
                 result = print_label_file(label_path, self.printer_name)
                 if result["status"] == "error":
                     raise RuntimeError(result["message"])
@@ -1528,6 +1721,7 @@ class TraceabilityApp(tk.Tk):
         self.package_final_product_auto = True
         self.package_reuse_lot = None
         self.package_prepared_mixture_id = None
+        self.package_mixture_modified = False
         self.ingredients_list.delete(0, tk.END)
         self.package_ingredient_entry.delete(0, tk.END)
         self.package_final_product_entry.delete(0, tk.END)
@@ -1561,11 +1755,13 @@ class TraceabilityApp(tk.Tk):
         return "break"
 
     def _remove_package_ingredient(self, index):
+        if self.package_prepared_mixture_id is not None:
+            self.package_mixture_modified = True
         del self.package_ingredients[index]
         self.ingredients_list.delete(index)
         self.package_reuse_lot = None
         self.package_prepared_mixture_id = None
-        if len(self.package_ingredients) == 1 and self.package_ingredients[0].get("mixture_id"):
+        if len(self.package_ingredients) == 1 and self.package_ingredients[0].get("mixture_id") and not self.package_mixture_modified:
             self.package_reuse_lot = self.package_ingredients[0]["supplier_lot"]
             self.package_prepared_mixture_id = self.package_ingredients[0]["mixture_id"]
         self._refresh_package_final_product_state()
@@ -1614,6 +1810,7 @@ class TraceabilityApp(tk.Tk):
         self.package_final_product_auto = False
         self.package_reuse_lot = row["packed_lot"]
         self.package_prepared_mixture_id = row["prepared_mixture_id"]
+        self.package_mixture_modified = False
 
         self.package_final_product_entry.delete(0, tk.END)
         self.package_final_product_entry.insert(0, row["name"])
@@ -1639,7 +1836,7 @@ class TraceabilityApp(tk.Tk):
             self._package_history_rows[iid] = row
             self.package_history_tree.insert(
                 "", "end", iid=iid,
-                values=(row["name"], sku, row["supplier_lot"], row["packed_lot"], row["expiry"], row["provenance"], row["quantity"], row["created_at"]),
+                values=(row["name"], sku, row["supplier_lot"], row["packed_lot"], row["expiry"], row["provenance"], row["quantity"], row["created_at"], row["prepared_mixture_barcode"] or ""),
             )
 
     def build_csv_tab(self):
@@ -2102,7 +2299,7 @@ class TraceabilityApp(tk.Tk):
 
         tk.Label(right, text="Receptes existents", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        self.recipe_list_tree = ttk.Treeview(right, columns=("Nom", "SKU", "Categoria"), show="headings")
+        self.recipe_list_tree = ttk.Treeview(right, columns=("Nom", "SKU", "Categoria"), show="headings", selectmode="extended")
         for text, width in (("Nom", 200), ("SKU", 90), ("Categoria", 130)):
             self.recipe_list_tree.heading(text, text=text)
             self.recipe_list_tree.column(text, width=width)
@@ -2115,15 +2312,23 @@ class TraceabilityApp(tk.Tk):
 
         search_row = tk.Frame(right)
         search_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        search_row.grid_columnconfigure(0, weight=1)
         self.recipe_search_var = tk.StringVar(value="")
-        self.recipe_search_entry = tk.Entry(search_row, textvariable=self.recipe_search_var, width=18)
-        self.recipe_search_entry.grid(row=0, column=0, sticky="w")
+        self.recipe_search_entry = tk.Entry(search_row, textvariable=self.recipe_search_var, width=12)
+        self.recipe_search_entry.grid(row=0, column=0, sticky="ew")
         self.recipe_search_var.trace_add("write", self._on_recipe_search_changed)
         self.recipe_search_entry.bind("<Up>", self._recipe_search_prev)
         self.recipe_search_entry.bind("<Down>", self._recipe_search_next)
         tk.Button(search_row, text="▲", command=self._recipe_search_prev, width=3).grid(row=0, column=1, padx=2)
         tk.Button(search_row, text="▼", command=self._recipe_search_next, width=3).grid(row=0, column=2, padx=2)
         tk.Button(search_row, text="✕", command=self._clear_recipe_search, width=3).grid(row=0, column=3, padx=2)
+
+        transfer_buttons = tk.Frame(search_row)
+        transfer_buttons.grid(row=0, column=4, sticky="e", padx=(8, 0))
+        self.recipe_import_button = ttk.Button(transfer_buttons, text="Importar...", command=self._on_import_recipes)
+        self.recipe_import_button.pack(side="left", padx=(0, 8))
+        self.recipe_export_button = ttk.Button(transfer_buttons, text="Exportar...", command=self._on_export_recipes)
+        self.recipe_export_button.pack(side="left")
 
         self._ensure_recipe_ingredient_blank_row()
         self._focus_first_recipe_ingredient_cell()
@@ -2138,9 +2343,9 @@ class TraceabilityApp(tk.Tk):
             row=0, column=0, sticky="w", pady=(0, 4),
         )
         self.prepared_mixture_tree = ttk.Treeview(
-            history_frame, columns=("Nom", "SKU", "LOT", "Caducitat", "Data de preparació"), show="headings", height=6,
+            history_frame, columns=("Nom", "SKU", "LOT", "Caducitat", "Data de preparació", "Codi barreja"), show="headings", height=6,
         )
-        for column, width in (("Nom", 300), ("SKU", 100), ("LOT", 120), ("Caducitat", 120), ("Data de preparació", 180)):
+        for column, width in (("Nom", 260), ("SKU", 80), ("LOT", 120), ("Caducitat", 120), ("Data de preparació", 160), ("Codi barreja", 170)):
             self.prepared_mixture_tree.heading(column, text=column)
             self.prepared_mixture_tree.column(column, width=width)
         self.prepared_mixture_tree.grid(row=1, column=0, sticky="nsew")
@@ -2149,7 +2354,7 @@ class TraceabilityApp(tk.Tk):
         scrollbar.grid(row=1, column=1, sticky="ns")
         self._setup_sortable_tree(self.prepared_mixture_tree)
         self.prepared_mixture_tree.bind("<Return>", self._on_prepared_mixture_select)
-        self.prepared_mixture_tree.bind("<Double-1>", self._on_prepared_mixture_select)
+        self.prepared_mixture_tree.bind("<Double-1>", self._on_prepared_mixture_double_click)
         quantity_row = tk.Frame(history_frame)
         quantity_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         tk.Label(quantity_row, text="Quantitat", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
@@ -2167,12 +2372,172 @@ class TraceabilityApp(tk.Tk):
             self._prepared_mixture_rows[iid] = mixture
             self.prepared_mixture_tree.insert(
                 "", "end", iid=iid,
-                values=(mixture["name"], mixture["sku"], mixture["lot"], mixture["expiry"], mixture["created_at"]),
+                values=(mixture["name"], mixture["sku"], mixture["lot"], mixture["expiry"], mixture["created_at"], mixture["barcode"]),
             )
         for iid in selection:
             if iid in self._prepared_mixture_rows:
                 self.prepared_mixture_tree.selection_set(iid)
         self.prepared_mixture_quantity_entry.delete(0, tk.END)
+        self._reapply_tree_sort(self.prepared_mixture_tree)
+
+    def _on_prepared_mixture_double_click(self, event):
+        iid = self.prepared_mixture_tree.identify_row(event.y)
+        if iid:
+            self._open_prepared_mixture_editor(int(iid))
+        return "break"
+
+    def _open_prepared_mixture_editor(self, mixture_id):
+        mixture = self.conn.execute("SELECT * FROM prepared_mixtures WHERE id = ?", (mixture_id,)).fetchone()
+        if mixture is None:
+            return
+        ingredients = json.loads(mixture["ingredients_json"])
+        dialog = tk.Toplevel(self)
+        dialog.title("Modificar preparació")
+        dialog.transient(self)
+        dialog.geometry(f"{min(1100, self.winfo_screenwidth() - 80)}x{min(620, self.winfo_screenheight() - 100)}")
+        dialog.minsize(760, 430)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+        dialog.grab_set()
+        details = tk.Frame(dialog, name="details")
+        details.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        for column in (1, 3):
+            details.grid_columnconfigure(column, weight=1)
+        fields = {}
+        for index, (key, label) in enumerate((
+            ("name", "Nom"), ("sku", "SKU"), ("lot", "Lot de sortida"), ("barcode", "Codi de barres"),
+            ("expiry", "Consum preferent"), ("created_at", "Data de producció"),
+        )):
+            tk.Label(details, text=label).grid(row=index // 2, column=index % 2 * 2, sticky="w", padx=(0, 8), pady=5)
+            entry = ttk.Entry(details, name=key)
+            entry.insert(0, mixture[key] or "")
+            if key in ("name", "sku"):
+                entry.configure(state="readonly")
+            entry.grid(row=index // 2, column=index % 2 * 2 + 1, sticky="ew", padx=(0, 12), pady=5)
+            fields[key] = entry
+
+        table_frame = tk.Frame(dialog, name="ingredient_table")
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=12)
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+        columns = (
+            ("name", "Nom", 180), ("sku", "SKU", 70), ("supplier", "Proveïdor", 130),
+            ("supplier_lot", "Lot d'entrada", 110), ("expiry", "Caducitat", 105), ("provenance", "Origen", 110),
+            ("barcode", "Codi", 130), ("created_at", "Data de recepció", 160), ("quantity", "Quantitat", 80),
+        )
+        tree = ttk.Treeview(table_frame, name="ingredients", columns=tuple(key for key, label, width in columns), show="tree headings")
+        tree.column("#0", width=36, minwidth=36, stretch=False)
+        for key, label, width in columns:
+            tree.heading(key, text=label)
+            tree.column(key, width=width, minwidth=60)
+        tree.grid(row=0, column=0, sticky="nsew")
+        self._attach_scrollbars(tree, horizontal=True)
+        rows = {}
+        editor = None
+        editing = None
+
+        def finish_edit(save=True):
+            nonlocal editor, editing
+            if editor is None:
+                return
+            entry, editor = editor, None
+            iid, key = editing
+            if save:
+                rows[iid][0][key] = entry.get().strip()
+                tree.set(iid, key, entry.get().strip())
+            entry.destroy()
+            editing = None
+
+        def rebuild():
+            finish_edit()
+            tree.delete(*tree.get_children())
+            rows.clear()
+
+            def insert(items, parent=""):
+                for item in items:
+                    iid = tree.insert(parent, "end", open=True, values=tuple(item.get(key) if item.get(key) is not None else "" for key, label, width in columns))
+                    rows[iid] = (item, items)
+                    insert(item.get("ingredients") or [], iid)
+
+            insert(ingredients)
+
+        def begin_edit(event):
+            finish_edit()
+            nonlocal editor, editing
+            iid = tree.identify_row(event.y)
+            column = tree.identify_column(event.x)
+            if not iid or column in ("", "#0"):
+                return "break"
+            key = columns[int(column[1:]) - 1][0]
+            bounds = tree.bbox(iid, column)
+            if not bounds:
+                return "break"
+            editing = (iid, key)
+            editor = ttk.Entry(tree, name="cell_editor")
+            editor.insert(0, tree.set(iid, key))
+            editor.place(x=bounds[0], y=bounds[1], width=bounds[2], height=bounds[3])
+            editor.focus_set()
+            editor.select_range(0, tk.END)
+            editor.bind("<Return>", lambda event: (finish_edit(), "break")[1])
+            editor.bind("<Escape>", lambda event: (finish_edit(False), "break")[1])
+            editor.bind("<FocusOut>", lambda event: finish_edit())
+            return "break"
+
+        def add_ingredient():
+            finish_edit()
+            ingredients.append({"name": "", "sku": "", "supplier": "", "supplier_lot": "", "expiry": "", "provenance": "", "barcode": ""})
+            rebuild()
+            iid = tree.get_children()[-1]
+            tree.selection_set(iid)
+            tree.see(iid)
+
+        def remove_ingredient():
+            finish_edit()
+            for iid in tree.selection():
+                if iid not in rows or not tree.exists(iid):
+                    continue
+                item, siblings = rows[iid]
+                siblings.pop(next(index for index, candidate in enumerate(siblings) if candidate is item))
+                tree.delete(iid)
+            rebuild()
+
+        def cancel():
+            finish_edit(False)
+            dialog.destroy()
+
+        def save():
+            finish_edit()
+            try:
+                with self._action(f"Preparació: modificar '{mixture['name']}'"):
+                    update_prepared_mixture(
+                        self.conn, mixture_id, fields["lot"].get(), fields["expiry"].get(),
+                        fields["barcode"].get(), fields["created_at"].get(), ingredients,
+                    )
+                    self._refresh_all_views()
+                    if self.package_prepared_mixture_id == mixture_id:
+                        updated = self.conn.execute("SELECT * FROM prepared_mixtures WHERE id = ?", (mixture_id,)).fetchone()
+                        quantity = self.package_quantity_entry.get()
+                        self._load_packaged_product_into_form_impl({
+                            **dict(updated), "packed_lot": updated["lot"], "prepared_mixture_id": mixture_id,
+                        })
+                        self.package_quantity_entry.insert(0, quantity)
+            except (ValueError, TypeError, sqlite3.Error) as exc:
+                messagebox.showerror("Preparació no guardada", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        tree.bind("<Double-1>", begin_edit)
+        tree.bind("<Delete>", lambda event: remove_ingredient())
+        buttons = tk.Frame(dialog, name="actions")
+        buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
+        ttk.Button(buttons, text="Afegir ingredient", command=add_ingredient).pack(side="left")
+        ttk.Button(buttons, text="Eliminar ingredient", command=remove_ingredient).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Cancel·lar", command=cancel).pack(side="right")
+        ttk.Button(buttons, text="Guardar", command=save).pack(side="right", padx=8)
+        dialog.bind("<Escape>", lambda event: cancel())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        rebuild()
+        fields["lot"].focus_set()
 
     def _on_prepared_mixture_select(self, event=None):
         if self.prepared_mixture_tree.selection():
@@ -2670,6 +3035,61 @@ class TraceabilityApp(tk.Tk):
         if self.recipe_list_tree.exists(str(recipe_id)):
             self.recipe_list_tree.see(str(recipe_id))
 
+    def _on_export_recipes(self):
+        selected = [int(iid) for iid in self.recipe_list_tree.selection()]
+        count = len(selected) if selected else len(self.recipe_list_tree.get_children())
+        if not count:
+            messagebox.showwarning("Sense receptes", "No hi ha receptes per exportar.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title=f"Exportar {count} receptes", defaultextension=".json",
+            initialfile="receptes.json", filetypes=[("Receptes JSON", "*.json"), ("Tots els fitxers", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            count = export_recipes_json(self.conn, path, selected or None)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Exportació no completada", str(exc))
+            return
+        messagebox.showinfo("Receptes exportades", f"S'han exportat {count} receptes a:\n{path}")
+
+    def _on_import_recipes(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Importar receptes", filetypes=[("Receptes JSON", "*.json"), ("Tots els fitxers", "*.*")],
+        )
+        if not paths:
+            return
+        try:
+            recipes = validate_recipes_data([recipe for path in paths for recipe in read_recipes_json(path)])
+            existing = list_recipes(self.conn)
+            skus = {recipe["sku"] for recipe in recipes if recipe["sku"]}
+            names = {recipe["name"].casefold() for recipe in recipes if not recipe["sku"]}
+            conflicts = [row for row in existing if row["sku"] in skus or (
+                not row["sku"] and row["name"].casefold() in names
+            )]
+            if conflicts and not messagebox.askyesno(
+                "Substituir receptes",
+                f"Ja existeixen {len(conflicts)} receptes amb el mateix SKU (o nom si no tenen SKU).\n"
+                "Vols substituir-ne les dades i els ingredients?\n\n"
+                + "\n".join(row["name"] for row in conflicts[:10]), parent=self,
+            ):
+                return
+            with self._action(f"Receptes: importar {len(recipes)} receptes"):
+                count = import_recipes(self.conn, recipes)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Importació no completada", str(exc))
+            return
+        self.populate_recipes_list()
+        if self.current_recipe_id in {row["id"] for row in conflicts}:
+            data = get_recipe_by_id(self.conn, self.current_recipe_id)
+            self._load_recipe_into_form(data["recipe"], data["ingredients"])
+        if self.package_viewing_recipe is not None:
+            self._open_package_recipe_view(self.package_viewing_recipe["id"])
+        else:
+            self._populate_package_recipe_lookup()
+        messagebox.showinfo("Receptes importades", f"S'han importat {count} receptes.")
+
     def _on_recipe_list_double_click(self, event):
         selection = self.recipe_list_tree.selection()
         if not selection:
@@ -2737,36 +3157,155 @@ class TraceabilityApp(tk.Tk):
 
     def build_historial_tab(self):
         frame = self.historial_tab
-        tk.Label(frame, text="Cerca per lot proveïdor, lot d'envasat, nom, data d'envasat o caducitat", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(12, 4))
-        self.search_var = tk.Entry(frame, width=50)
-        self.search_var.grid(row=0, column=1, padx=10, pady=(12, 4), sticky="w")
-        self.search_var.bind("<Return>", lambda event: self.refresh_history())
-        tk.Button(frame, text="Buscar", command=self.refresh_history, width=12).grid(row=0, column=2, padx=10, pady=(12, 4), sticky="w")
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        sessions_panel = tk.Frame(frame)
+        sessions_panel.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=12)
+        sessions_panel.grid_columnconfigure(0, weight=1)
+        sessions_panel.grid_rowconfigure(1, weight=1)
+        tk.Label(sessions_panel, text="Sessions", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        session_list = tk.Frame(sessions_panel)
+        session_list.grid(row=1, column=0, sticky="nsew")
+        session_list.grid_columnconfigure(0, weight=1)
+        session_list.grid_rowconfigure(0, weight=1)
+        self.sessions_tree = ttk.Treeview(session_list, columns=("Sessió", "Inici"), show="headings", selectmode="browse")
+        self.sessions_tree.tag_configure("search_match", background="#dff2dd", foreground="#245b2d", font=("Segoe UI", 9, "bold"))
+        self.sessions_tree.heading("Sessió", text="Sessió")
+        self.sessions_tree.heading("Inici", text="Inici")
+        self.sessions_tree.column("Sessió", width=95, minwidth=95, stretch=False)
+        self.sessions_tree.column("Inici", width=145, minwidth=130)
+        self.sessions_tree.grid(row=0, column=0, sticky="nsew")
+        self._attach_scrollbars(self.sessions_tree)
+        self.sessions_tree.bind("<<TreeviewSelect>>", self._on_history_session_selected)
+        self.session_export_button = tk.Button(
+            sessions_panel, text="Exportar sessió actual", command=self.export_session, bg="#5a4db5", fg="white",
+        )
+        self.session_export_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
-        tk.Button(frame, text="Exportar sessió actual", command=self.export_session, width=22, bg="#5a4db5", fg="white").grid(row=1, column=1, sticky="w", padx=10, pady=8)
-
-        self.history_tree = ttk.Treeview(frame, columns=("Nom", "Lot envasat", "Lot proveïdor", "Caducitat", "Origen", "Quantitat"), show="headings")
+        history_panel = tk.Frame(frame)
+        history_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 10), pady=12)
+        history_panel.grid_columnconfigure(0, weight=1)
+        history_panel.grid_rowconfigure(1, weight=1)
+        search_row = tk.Frame(history_panel)
+        search_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        search_row.grid_columnconfigure(0, weight=1)
+        tk.Label(search_row, text="Cerca per nom, lot, data o caducitat", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.search_var = tk.Entry(search_row)
+        self.search_var.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        self.search_var.bind("<Return>", self._submit_history_search)
+        self.search_var.bind("<KeyRelease>", self._on_history_search_keyrelease)
+        self.search_var.bind("<Down>", lambda event: self._on_suggestions_down_from(self.search_var))
+        self.search_var.bind("<Escape>", self._clear_history_search)
+        self.history_search_button = tk.Button(search_row, text="Buscar", command=self._submit_history_search, width=10)
+        self.history_search_button.grid(row=1, column=1, sticky="e")
+        self.history_all_sessions_var = tk.BooleanVar(value=False)
+        self.history_all_sessions_check = ttk.Checkbutton(
+            search_row, text="Totes les sessions", variable=self.history_all_sessions_var,
+            command=self._on_history_scope_changed,
+        )
+        self.history_all_sessions_check.grid(row=1, column=2, sticky="w", padx=(8, 6))
+        self.history_clear_button = tk.Button(search_row, text="✕", width=3, command=self._clear_history_search)
+        self.history_clear_button.grid(row=1, column=3, sticky="e")
+        self.history_tree = ttk.Treeview(history_panel, columns=("Nom", "Lot envasat", "Lot proveïdor", "Caducitat", "Origen", "Quantitat"), show="headings")
+        self.history_tree.tag_configure("session_separator", background="#dce5e8", foreground="#25363c", font=("Segoe UI", 9, "bold"))
         for text in ("Nom", "Lot envasat", "Lot proveïdor", "Caducitat", "Origen", "Quantitat"):
             self.history_tree.heading(text, text=text)
             self.history_tree.column(text, width=180)
-        self.history_tree.grid(row=2, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
+        self.history_tree.grid(row=1, column=0, sticky="nsew")
         self._attach_scrollbars(self.history_tree, horizontal=True)
-        frame.grid_columnconfigure(1, weight=1)
-        frame.grid_rowconfigure(2, weight=1)
+
+    def _history_search_session_id(self):
+        return None if self.history_all_sessions_var.get() else self.selected_session_id
+
+    def _submit_history_search(self, event=None):
+        self._hide_suggestions()
+        self.refresh_history()
+        return "break"
+
+    def _clear_history_search(self, event=None):
+        self.search_var.delete(0, tk.END)
+        self._hide_suggestions()
+        self.refresh_history()
+        self.search_var.focus_set()
+        return "break"
+
+    def _on_history_scope_changed(self):
+        self._hide_suggestions()
+        self.refresh_history()
+        self._on_history_search_keyrelease()
+
+    def _on_history_search_keyrelease(self, event=None):
+        if event is not None and event.keysym in ("Up", "Down", "Tab", "Return", "Escape"):
+            return
+        term = self.search_var.get().strip()
+        matches = search_history_suggestions(self.conn, term, session_id=self._history_search_session_id())
+        if not matches:
+            self._hide_suggestions()
+            return
+
+        def apply_suggestion(value):
+            self.search_var.delete(0, tk.END)
+            self.search_var.insert(0, value)
+            self._submit_history_search()
+            self.search_var.focus_set()
+
+        self._show_suggestions(self.search_var, matches, matches, apply_suggestion)
+
+    def _refresh_history_sessions(self):
+        sessions = list_sessions(self.conn)
+        ids = {row["id"] for row in sessions}
+        if self.selected_session_id not in ids:
+            self.selected_session_id = self.session_id
+        for iid in self.sessions_tree.get_children():
+            self.sessions_tree.delete(iid)
+        for session in sessions:
+            label = f"{session['id']} (actual)" if session["id"] == self.session_id else str(session["id"])
+            self.sessions_tree.insert("", "end", iid=str(session["id"]), values=(label, session["started_at"]))
+        iid = str(self.selected_session_id)
+        if self.sessions_tree.exists(iid):
+            self.sessions_tree.selection_set(iid)
+            self.sessions_tree.focus(iid)
+            self.sessions_tree.see(iid)
+        self.session_export_button.configure(text=(
+            "Exportar sessió actual" if self.selected_session_id == self.session_id else "Exportar sessió seleccionada"
+        ))
+
+    def _on_history_session_selected(self, event=None):
+        selected = self.sessions_tree.selection()
+        if selected and int(selected[0]) != self.selected_session_id:
+            self.selected_session_id = int(selected[0])
+            if self.suggestions_anchor_entry is self.search_var:
+                self._hide_suggestions()
+            self.refresh_history()
 
     def refresh_materials(self):
         materials = list_raw_materials(self.conn)
         self.populate_received_table(materials)
 
     def populate_received_table(self, materials):
+        self._hide_received_print_tooltip()
+        for button in self._received_print_buttons.values():
+            button.destroy()
+        self._received_print_buttons.clear()
         for row in self.received_tree.get_children():
             self.received_tree.delete(row)
         for row in materials[:20]:
             sku = get_catalog_sku_by_name(self.conn, row["name"]) or ""
+            iid = str(row["id"])
             self.received_tree.insert(
-                "", "end",
-                values=(row["name"], row["supplier"], sku, row["supplier_lot"], row["provenance"], row["expiry"], row["barcode"], row["created_at"]),
+                "", "end", iid=iid,
+                values=(row["name"], row["supplier"], sku, row["supplier_lot"], row["provenance"], row["expiry"], row["barcode"], row["created_at"], ""),
             )
+            self._received_print_buttons[iid] = ttk.Button(
+                self.received_tree, text="\U0001f5a8", width=1, style="ReceiptPrint.TButton",
+                command=lambda material=dict(row): self._print_received_material(material), takefocus=False,
+            )
+            button = self._received_print_buttons[iid]
+            button.bind("<Enter>", self._show_received_print_tooltip)
+            button.bind("<Leave>", self._hide_received_print_tooltip)
+            button.bind("<ButtonPress-1>", self._hide_received_print_tooltip)
+        self._reapply_tree_sort(self.received_tree)
+        self.after_idle(self._position_received_print_buttons)
 
     def _register_received_material(self, name, supplier, supplier_lot, provenance, expiry):
         expiry_date = parse_date(expiry)
@@ -2775,11 +3314,7 @@ class TraceabilityApp(tk.Tk):
             raise ValueError(
                 f"No hi ha cap SKU relacionat amb '{name}' al catàleg importat. Importa'l a la pestanya Productes abans de continuar."
             )
-        today_prefix = f"{date.today().strftime('%Y%m%d')}{sku}"
-        sequence = count_barcodes_with_prefix(self.conn, today_prefix) + 1
-        if sequence > 99:
-            raise ValueError(f"Ja s'han registrat 99 entrades avui per '{name}'. No es pot generar un nou codi de barres.")
-        barcode = generate_barcode_from_sku(sku, sequence=sequence)
+        barcode = next_inventory_barcode(self.conn, sku)
         expiry = expiry_date.isoformat() if expiry_date else ""
         with self._action(f"Recepció: {name} (lot {supplier_lot})"):
             add_raw_material(self.conn, name, supplier, supplier_lot, provenance, expiry, barcode)
@@ -2812,7 +3347,10 @@ class TraceabilityApp(tk.Tk):
 
         try:
             label_path = create_label_image(name, supplier_lot, provenance, expiry, barcode, supplier=supplier)
-            print_label_file(label_path, self.printer_name)
+            result = print_label_file(label_path, self.printer_name)
+            if result["status"] != "printed":
+                messagebox.showwarning("Etiqueta no impresa", result["message"])
+                return
         except Exception as exc:
             messagebox.showwarning(
                 "Etiqueta no generada",
@@ -2833,15 +3371,26 @@ class TraceabilityApp(tk.Tk):
         self.raw_name.focus_set()
 
     def refresh_history(self):
+        self._refresh_history_sessions()
         term = self.search_var.get().strip() if hasattr(self, "search_var") else ""
-        if term:
-            rows = search_packaged(self.conn, term)
-        else:
-            rows = list_packaged_products(self.conn)
+        rows = list_history_packaged_products(self.conn, term, session_id=self._history_search_session_id())
+        matching_sessions = {row["session_id"] for row in rows} if self.history_all_sessions_var.get() and term else set()
+        for iid in self.sessions_tree.get_children():
+            self.sessions_tree.item(iid, tags=("search_match",) if int(iid) in matching_sessions else ())
 
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
+        previous_session = object()
         for row in rows:
+            if self.history_all_sessions_var.get() and row["session_id"] != previous_session:
+                previous_session = row["session_id"]
+                session_label = f"Sessió {row['session_id']}" if row["session_id"] is not None else "Sense sessió"
+                if row["session_id"] == self.session_id:
+                    session_label += " (actual)"
+                self.history_tree.insert(
+                    "", "end", iid=f"session:{row['session_id']}",
+                    values=(session_label, row["session_started_at"] or "", "", "", "", ""), tags=("session_separator",),
+                )
             self.history_tree.insert(
                 "",
                 "end",
@@ -2856,10 +3405,11 @@ class TraceabilityApp(tk.Tk):
             )
 
     def export_session(self):
+        session_id = self.selected_session_id if self.selected_session_id is not None else self.session_id
         export_dir = os.path.join("output", "sessions")
         os.makedirs(export_dir, exist_ok=True)
-        target_path = os.path.join(export_dir, f"sessio_{self.session_id}.csv")
-        count = export_session_csv(self.conn, self.session_id, target_path)
+        target_path = os.path.join(export_dir, f"sessio_{session_id}.csv")
+        count = export_session_csv(self.conn, session_id, target_path)
         messagebox.showinfo("Exportació completada", f"S'han exportat {count} registres a:\n{target_path}")
 
     # ---- Desfer / refer ----
@@ -3051,6 +3601,7 @@ class TraceabilityApp(tk.Tk):
                 "final_auto": self.package_final_product_auto,
                 "reuse_lot": self.package_reuse_lot,
                 "mixture_id": self.package_prepared_mixture_id,
+                "mixture_modified": self.package_mixture_modified,
                 "final_text": self.package_final_product_entry.get(),
                 "quantity_text": self.package_quantity_entry.get(),
             },
@@ -3081,6 +3632,7 @@ class TraceabilityApp(tk.Tk):
         self.package_final_product_auto = package["final_auto"]
         self.package_reuse_lot = package["reuse_lot"]
         self.package_prepared_mixture_id = package["mixture_id"]
+        self.package_mixture_modified = package.get("mixture_modified", False)
         self.package_final_product_entry.delete(0, tk.END)
         self.package_final_product_entry.insert(0, package["final_text"])
         self.package_quantity_entry.delete(0, tk.END)

@@ -2,7 +2,15 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-linux/
 venv/
+.pytest_cache/
+build/
+dist/
+.tmp.driveupload/
+.tmp.drivedownload/
+Receptes/
 output/
 data/*.db
+data/*.db-*
 *.log
