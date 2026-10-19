@@ -1,7 +1,21 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from datetime import date, datetime
 from typing import Iterable
+
+
+def expiry_status(value, reference_date=None):
+    expiry = parse_date(value)
+    if expiry is None:
+        return ""
+    today = reference_date or date.today()
+    month_index = today.year * 12 + today.month - 1 + 3
+    year, month = divmod(month_index, 12)
+    threshold = date(year, month + 1, min(today.day, monthrange(year, month + 1)[1]))
+    if expiry < today:
+        return "expired"
+    return "expiring" if expiry < threshold else ""
 
 
 def parse_date(value):

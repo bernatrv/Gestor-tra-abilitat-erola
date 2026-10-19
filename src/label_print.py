@@ -13,9 +13,12 @@ from barcode.writer import ImageWriter
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.graphics.barcode.code128 import Code128
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from src.printing import load_label_settings, print_document_file, print_label_windows
+from src.label_templates import save_template_job
 
 
 OUTPUT_DIR = os.path.join("output", "labels")
@@ -118,6 +121,11 @@ def create_packaged_label_image(product_name: str, lot_number: str, provenance: 
     return _render_product_label(product_name, lot_number, lines)
 
 
+def create_packaged_template_job(template, values, copies):
+    path = _new_label_path(values["producte"], values["lot"], ".json")
+    return save_template_job(path, template, values, copies)
+
+
 def create_mixture_label_image(name, lot, sku, expiry, barcode_value, prepared_at, ingredients):
     path = _new_label_path(name, lot, ".pdf")
     document = SimpleDocTemplate(path, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30,
@@ -180,29 +188,63 @@ def create_mixture_label_image(name, lot, sku, expiry, barcode_value, prepared_a
     return path
 
 
+def create_session_document(rows, session_id, target_path):
+    document = SimpleDocTemplate(str(target_path), pagesize=landscape(A4), leftMargin=24, rightMargin=24,
+                                 topMargin=30, bottomMargin=30, title=f"Sessió {session_id}")
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle("SessionCell", parent=styles["BodyText"], fontSize=8, leading=11)
+
+    def cell(value):
+        return Paragraph(escape(str(value if value is not None else "")), cell_style)
+
+    data = [[cell(value) for value in ("Nom", "SKU", "Lot envasat", "Lot d'entrada", "Caducitat", "Origen", "Quantitat", "Pes (kg)")]]
+    for row in rows:
+        data.append([cell(value) for value in (
+            row["name"], row["sku"], row["packed_lot"],
+            row["supplier_lot"] if row["prepared_mixture_id"] is None else "",
+            row["expiry"], row["provenance"], row["quantity"],
+            f"{row['weight']:g}" if row["weight"] is not None else "",
+        )])
+    table = Table(data, colWidths=[document.width * fraction for fraction in (.23, .08, .13, .13, .12, .13, .09, .09)],
+                  repeatRows=1, splitInRow=1)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), .5, colors.HexColor("#999999")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8e8e8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.drawRightString(landscape(A4)[0] - 24, 16, f"Pàgina {doc.page}")
+        canvas.restoreState()
+
+    document.build([Paragraph(f"Sessió {session_id}", styles["Title"]),
+                    Paragraph(f"{len(rows)} registres", styles["BodyText"]), Spacer(1, 12), table],
+                   onFirstPage=footer, onLaterPages=footer)
+    return str(target_path)
+
+
 def print_label_file(label_path: str, printer_name: str | None = None) -> dict:
     if not label_path or not os.path.exists(label_path):
         return {"status": "error", "message": "No s'ha pogut generar l'etiqueta."}
+
+    if os.path.splitext(label_path)[1].lower() == ".pdf":
+        return print_document_file(label_path)
 
     if not printer_name:
         return {"status": "skipped", "message": f"No hi ha una impressora configurada; fitxer desat a {label_path}"}
 
     try:
         if os.name == "nt":
-            escaped_path = os.path.abspath(label_path).replace("'", "''")
-            subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    f"Start-Process -FilePath '{escaped_path}' -Verb Print -ErrorAction Stop",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            print_label_windows(label_path, printer_name, load_label_settings())
         else:
-            subprocess.run(["lp", "-d", printer_name, label_path], check=True, capture_output=True, text=True)
+            settings = load_label_settings()
+            command = ["lp", "-d", printer_name, "-n", "1"]
+            if settings["custom_size"]:
+                command.extend(["-o", f"media=Custom.{settings['width_mm']:g}x{settings['height_mm']:g}mm"])
+            subprocess.run(command + [label_path], check=True, capture_output=True, text=True)
         return {"status": "printed", "message": f"Etiqueta enviada a {printer_name}."}
     except Exception as exc:  # pragma: no cover - depends on printer environment
         return {"status": "error", "message": f"No s'ha pogut imprimir: {exc}\nFitxer desat a {label_path}"}

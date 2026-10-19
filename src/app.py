@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from src.core import (
     compute_expiry_from_ingredients,
+    expiry_status,
     generate_daily_sequential_lot,
     generate_packed_lot,
     ingredient_matches_recipe_ingredients,
@@ -59,6 +60,7 @@ from src.db import (
     list_packaged_products,
     list_prepared_mixtures,
     list_raw_materials,
+    list_received_history,
     list_recipes,
     list_recipes_with_ingredients,
     list_sessions,
@@ -80,7 +82,9 @@ from src.db import (
     upsert_recipe,
     validate_recipes_data,
 )
-from src.label_print import create_label_image, create_mixture_label_image, create_packaged_label_image, print_label_file
+from src.label_print import create_label_image, create_mixture_label_image, create_packaged_label_image, create_packaged_template_job, create_session_document, print_label_file
+from src.label_templates import get_product_template, print_template_job
+from src.printing import list_printers, load_label_settings, printer_preferences, save_label_settings
 
 _CATALOG_COLUMNS = ("SKU", "Nom", "Pes", "Categoria")
 _CATALOG_EDITABLE_COLUMNS = ("SKU", "Nom", "Pes")
@@ -95,7 +99,7 @@ class ThinPanedWindow(tk.PanedWindow):
         super().__init__(
             parent, **options, sashwidth=2, sashpad=6, sashrelief=tk.FLAT, opaqueresize=False,
             background=background or parent.winfo_toplevel().cget("background"), borderwidth=0,
-            proxybackground="#666666", proxyborderwidth=0, proxyrelief=tk.FLAT,
+            proxybackground=background or parent.winfo_toplevel().cget("background"), proxyborderwidth=0, proxyrelief=tk.FLAT,
         )
         self._sash_lines = []
         self._sash_line_job = None
@@ -116,7 +120,7 @@ class ThinPanedWindow(tk.PanedWindow):
         horizontal = str(self.cget("orient")) == "horizontal"
         count = max(0, len(self.panes()) - 1)
         while len(self._sash_lines) < count:
-            line = tk.Frame(self, background="#999999", borderwidth=0, highlightthickness=0,
+            line = tk.Frame(self, background=self.cget("background"), borderwidth=0, highlightthickness=0,
                             cursor="sb_h_double_arrow" if horizontal else "sb_v_double_arrow")
             for sequence in ("<Motion>", "<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
                 line.bind(sequence, lambda event, sequence=sequence: self._forward_sash_event(event, sequence))
@@ -151,7 +155,7 @@ class TraceabilityApp(tk.Tk):
         available_height = max(1, self.winfo_screenheight() - 100)
         self.geometry(f"{min(1200, available_width)}x{min(760, available_height)}")
         self.minsize(min(1000, available_width), min(500, available_height))
-        self.printer_name = "Epson ColorWorks CW-C4000e"
+        self.printer_name = load_label_settings()["printer"]
         self.suppress_printer_alerts = tk.BooleanVar(self, value=False)
         self.package_ingredients: list[dict] = []
         self.package_final_product: dict | None = None
@@ -211,9 +215,94 @@ class TraceabilityApp(tk.Tk):
         edit_menu.add_separator()
         edit_menu.add_command(label="Historial", command=self.show_history_window)
         menubar.add_cascade(label="Edita", menu=edit_menu)
+        printing_menu = tk.Menu(menubar, tearoff=0)
+        printing_menu.add_command(label="Configurar etiquetes...", command=self._show_label_print_settings)
+        printing_menu.add_command(label="Plantilles d'envasat...", command=self._show_template_manager)
+        printing_menu.add_command(label="Reimprimir feina de plantilla...", command=self._reprint_template_job)
+        menubar.add_cascade(label="Impressió", menu=printing_menu)
         self.bind_all("<Control-z>", self._on_undo_shortcut)
         self.bind_all("<Control-y>", self._on_redo_shortcut)
         self.config(menu=menubar)
+
+    def _reprint_template_job(self):
+        path = filedialog.askopenfilename(parent=self, title="Reimprimir feina de plantilla", initialdir=os.path.join("output", "labels"),
+                                          filetypes=[("Feina d'etiquetes Erola", "*.json")])
+        if path and messagebox.askyesno("Reimprimir etiquetes", "Comprova la cua per evitar duplicats si la feina anterior s'ha imprès parcialment. Vols tornar a enviar totes les còpies?", parent=self):
+            result = self._print_saved_labels([path])
+            if result["status"] == "printed":
+                messagebox.showinfo("Etiquetes enviades", result.get("message", "Feina enviada."), parent=self)
+
+    def _show_template_manager(self):
+        from src.template_manager import TemplateManager
+
+        try:
+            return TemplateManager(self)
+        except Exception as exc:
+            messagebox.showerror("Plantilles d'envasat", str(exc), parent=self)
+
+    def _show_label_print_settings(self):
+        settings = load_label_settings()
+        dialog = tk.Toplevel(self)
+        dialog.title("Impressió d'etiquetes")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        selected = tk.StringVar(dialog, value=self.printer_name)
+        custom_size = tk.BooleanVar(dialog, value=settings["custom_size"])
+        width = tk.StringVar(dialog, value=f"{settings['width_mm']:g}")
+        height = tk.StringVar(dialog, value=f"{settings['height_mm']:g}")
+        tk.Label(dialog, text="Impressora").grid(row=0, column=0, sticky="w", padx=12, pady=8)
+        try:
+            printers = list_printers()
+        except Exception as exc:
+            printers = []
+            messagebox.showerror("Impressores no disponibles", str(exc), parent=dialog)
+        combo = ttk.Combobox(dialog, textvariable=selected, values=printers, width=42, state="readonly")
+        combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=12, pady=8)
+
+        def preferences():
+            try:
+                printer_preferences(selected.get(), dialog.winfo_id())
+            except Exception as exc:
+                messagebox.showerror("Preferències de la impressora", str(exc), parent=dialog)
+
+        ttk.Button(dialog, text="Preferències del controlador...", command=preferences).grid(row=1, column=1, columnspan=2, sticky="w", padx=12, pady=8)
+        size_inputs = []
+
+        def update_size_state():
+            for entry in size_inputs:
+                entry.configure(state="normal" if custom_size.get() else "disabled")
+
+        ttk.Checkbutton(dialog, text="Mida personalitzada", variable=custom_size,
+                        command=update_size_state).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=8)
+        for row, text, variable in ((3, "Amplada (mm)", width), (4, "Alçada (mm)", height)):
+            tk.Label(dialog, text=text).grid(row=row, column=0, sticky="w", padx=12, pady=8)
+            entry = ttk.Spinbox(dialog, textvariable=variable, from_=1, to=1000, increment=1, width=12)
+            entry.grid(row=row, column=1, sticky="w", padx=12, pady=8)
+            size_inputs.append(entry)
+        update_size_state()
+
+        def save():
+            try:
+                if selected.get() not in printers:
+                    raise ValueError("Selecciona una impressora instal·lada.")
+                save_label_settings({"printer": selected.get(), "custom_size": custom_size.get(),
+                                     "width_mm": width.get().replace(",", "."), "height_mm": height.get().replace(",", ".")})
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("Configuració no guardada", str(exc), parent=dialog)
+                return
+            self.printer_name = selected.get()
+            dialog.destroy()
+
+        buttons = tk.Frame(dialog)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        ttk.Button(buttons, text="Desar", command=save).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Cancel·lar", command=dialog.destroy).pack(side="left", padx=4)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        dialog.update_idletasks()
+        dialog.wait_visibility()
+        dialog.update_idletasks()
+        dialog.grab_set()
+        combo.focus_set()
 
     def _open_database(self, path: str):
         new_conn = initialize_db(path)
@@ -449,6 +538,8 @@ class TraceabilityApp(tk.Tk):
         return "break"
 
     def _on_tab_changed(self, event):
+        if event.widget is not self.notebook:
+            return
         selected = event.widget.select()
         if not selected:
             return
@@ -465,6 +556,8 @@ class TraceabilityApp(tk.Tk):
         }.get(tab_text)
         if focus_widget is not None:
             focus_widget.focus_set()
+        if tab_text == "Productes":
+            self._on_products_tab_changed()
 
     def _attach_scrollbars(self, widget, horizontal: bool = False):
         """Afegeix barres de desplaçament que només es mostren quan el contingut no hi cap."""
@@ -666,15 +759,23 @@ class TraceabilityApp(tk.Tk):
         result = {"status": "printed", "message": "Etiquetes impreses."}
         for path in paths:
             try:
-                result = print_label_file(path, self.printer_name)
-            except Exception:
-                result = {"status": "error", "message": "No s'ha trobat impressora."}
-            if result.get("status") != "printed":
+                if Path(path).suffix.lower() == ".json":
+                    result = print_template_job(path, self.printer_name)
+                else:
+                    result = print_label_file(path, None if Path(path).suffix.lower() == ".pdf" else self.printer_name)
+            except Exception as exc:
+                result = {"status": "error", "message": f"No s'ha pogut imprimir: {exc}\nFitxer desat a: {path}"}
+            if result.get("status") not in ("printed", "cancelled", "opened"):
                 failure = failure or result
                 if result.get("status") == "error":
                     break
         if failure:
-            self._show_label_saved_notice(path, parent=parent)
+            if Path(path).suffix.lower() == ".json":
+                messagebox.showwarning("Plantilla no impresa", failure.get("message", str(path)), parent=parent or self)
+            elif Path(path).suffix.lower() == ".pdf":
+                messagebox.showwarning("Document no imprès", failure.get("message", str(path)), parent=parent or self)
+            else:
+                self._show_label_saved_notice(path, parent=parent)
         return failure or result
 
     def _open_label_directory(self, directory, parent=None):
@@ -1836,6 +1937,24 @@ class TraceabilityApp(tk.Tk):
         with self._action(f"Envasat: {product_name} (quantitat {quantity_text})"):
             return self._finalize_packaging_impl(event)
 
+    def _warn_packaging_expiry(self, ingredients):
+        warnings = []
+
+        def visit(items):
+            for item in items:
+                try:
+                    status = expiry_status(item.get("expiry"))
+                except ValueError:
+                    status = ""
+                if status:
+                    state = "CADUCAT" if status == "expired" else "Caduca en menys de 3 mesos"
+                    warnings.append(f"{item.get('name', '')} | Lot {item.get('supplier_lot', '')} | {item.get('expiry', '')}: {state}")
+                visit(item.get("ingredients") or [])
+
+        visit(ingredients)
+        if warnings:
+            messagebox.showwarning("Avís de caducitat", "\n".join(dict.fromkeys(warnings)), parent=self)
+
     def _finalize_packaging_impl(self, event=None):
         if not self.package_ingredients:
             messagebox.showwarning("Sense ingredients", "Afegeix almenys un ingredient abans de continuar.")
@@ -1923,6 +2042,8 @@ class TraceabilityApp(tk.Tk):
             self.package_status.set(f"Barreja preparada: {product_name} | Lot {packed_lot} | Envasats: {quantity}")
             return "break"
 
+        if quantity:
+            self._warn_packaging_expiry(self.package_ingredients)
         add_packaged_product(
             self.conn,
             product_name,
@@ -1942,12 +2063,8 @@ class TraceabilityApp(tk.Tk):
         self.populate_package_history()
         self.refresh_history()
         try:
-            label_paths = [
-                create_packaged_label_image(product_name, packed_lot, provenance, str(expiry_date), weight=weight)
-                for label_index in range(quantity or 1)
-            ]
-            result = self._print_saved_labels(label_paths)
-            status_extra = "Etiquetes impreses." if result["status"] == "printed" else "No s'ha trobat impressora."
+            result = self._print_packaged_product_labels(product_name, sku_value, packed_lot, provenance, str(expiry_date), weight, quantity or 1)
+            status_extra = "Etiquetes impreses." if result["status"] == "printed" else "Etiquetes no impreses."
         except Exception as exc:
             status_extra = f"etiqueta no impresa: {exc}"
 
@@ -1956,6 +2073,10 @@ class TraceabilityApp(tk.Tk):
         return "break"
 
     def _record_prepared_mixture_packaging(self, mixture, quantity):
+        self._warn_packaging_expiry([
+            {"name": mixture["name"], "supplier_lot": mixture["lot"], "expiry": mixture["expiry"],
+             "ingredients": json.loads(mixture["ingredients_json"])},
+        ])
         catalog_product = get_catalog_row_by_sku(self.conn, mixture["sku"]) if mixture["sku"] else None
         weight = (catalog_product["weight"] if catalog_product else get_catalog_weight_by_name(self.conn, mixture["name"])) or 0.0
         with self._action(f"Envasar barreja: {mixture['name']} (quantitat {quantity})"):
@@ -1966,13 +2087,29 @@ class TraceabilityApp(tk.Tk):
         self.populate_package_history()
         self.refresh_history()
         try:
-            label_paths = [
-                create_packaged_label_image(mixture["name"], mixture["lot"], "", mixture["expiry"], weight=weight)
-                for label_index in range(quantity)
-            ]
-            self._print_saved_labels(label_paths)
+            self._print_packaged_product_labels(mixture["name"], mixture["sku"], mixture["lot"], "", mixture["expiry"], weight, quantity)
         except Exception as exc:
             messagebox.showwarning("Etiqueta no generada", str(exc))
+
+    def _print_packaged_product_labels(self, name, sku, lot, provenance, expiry, weight, copies):
+        try:
+            template = get_product_template(self.conn, sku, name)
+            if template is None:
+                paths = [create_packaged_label_image(name, lot, provenance, expiry, weight=weight) for index in range(copies)]
+            else:
+                expiry_date = parse_date(expiry)
+                values = {
+                    "producte": name, "sku": sku or "", "lot": lot, "origen": provenance or "",
+                    "caducitat": expiry, "caducitat_dmy": expiry_date.strftime("%d/%m/%Y") if expiry_date else "",
+                    "pes_kg": f"{weight:g}" if weight is not None else "",
+                    "pes": f"{weight:g} kg" if weight is not None else "",
+                    "data_envasat": date.today().isoformat(), "codi_barres": lot,
+                }
+                paths = [create_packaged_template_job(template, values, copies)]
+            return self._print_saved_labels(paths)
+        except Exception as exc:
+            messagebox.showwarning("Etiquetes no generades", str(exc), parent=self)
+            return {"status": "error", "message": str(exc)}
 
     def _clear_package_form(self):
         self.package_ingredients = []
@@ -2099,7 +2236,16 @@ class TraceabilityApp(tk.Tk):
             )
 
     def build_csv_tab(self):
-        frame = self.csv_tab
+        self.csv_tab.grid_columnconfigure(0, weight=1)
+        self.csv_tab.grid_rowconfigure(0, weight=1)
+        self.products_notebook = ttk.Notebook(self.csv_tab)
+        self.products_notebook.grid(row=0, column=0, sticky="nsew")
+        frame = tk.Frame(self.products_notebook)
+        self.products_notebook.add(frame, text="Catàleg")
+        self.received_history_tab = tk.Frame(self.products_notebook)
+        self.products_notebook.add(self.received_history_tab, text="Rebuts")
+        self._build_received_history_tab()
+        self.products_notebook.bind("<<NotebookTabChanged>>", self._on_products_tab_changed)
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(1, weight=1)
 
@@ -2152,6 +2298,94 @@ class TraceabilityApp(tk.Tk):
         tk.Button(catalog_actions, text="✓", command=self._show_edited_products_window, width=3).pack(side="left")
         self.catalog_export_button = ttk.Button(catalog_actions, text="Exportar catàleg CSV", command=self._export_catalog)
         self.catalog_export_button.pack(side="left", padx=(6, 0))
+
+    def _on_products_tab_changed(self, event=None):
+        if self.products_notebook.select() == str(self.received_history_tab):
+            if self.conn is not None:
+                self._populate_received_history()
+            self.received_search_entry.focus_set()
+        else:
+            self.product_search_entry.focus_set()
+
+    def _build_received_history_tab(self):
+        panel = self.received_history_tab
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
+        search = tk.Frame(panel)
+        search.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        search.grid_columnconfigure(1, weight=1)
+        tk.Label(search, text="Cerca").grid(row=0, column=0, padx=(0, 8))
+        self.received_search_entry = tk.Entry(search)
+        self.received_search_entry.grid(row=0, column=1, sticky="ew")
+        self.received_search_entry.bind("<KeyRelease>", self._on_received_search)
+        self.received_search_entry.bind("<Down>", lambda event: self._on_suggestions_down_from(self.received_search_entry))
+        self.received_search_entry.bind("<Return>", self._submit_received_search)
+        self.received_search_entry.bind("<Escape>", self._clear_received_search)
+        ttk.Button(search, text="✕", width=3, command=self._clear_received_search).grid(row=0, column=2, padx=(8, 0))
+        table = tk.Frame(panel)
+        table.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        table.grid_columnconfigure(0, weight=1)
+        table.grid_rowconfigure(0, weight=1)
+        columns = ("Nom", "SKU", "Proveïdor", "Lot d'entrada", "Origen", "Caducitat", "Codi de barres", "Data de recepció")
+        self.received_history_tree = ttk.Treeview(table, columns=columns, show="headings")
+        for column in columns:
+            self.received_history_tree.heading(column, text=column)
+            self.received_history_tree.column(column, width=180 if column in ("Nom", "Codi de barres", "Data de recepció") else 120)
+        self.received_history_tree.grid(row=0, column=0, sticky="nsew")
+        self._attach_scrollbars(self.received_history_tree, horizontal=True)
+        self._setup_sortable_tree(self.received_history_tree)
+        self.received_history_tree.tag_configure("expiring", background="#ffe0b2", foreground="#7c3900")
+        self.received_history_tree.tag_configure("expired", background="#ffd6d6", foreground="#990000")
+        self.received_history_tree.bind("<Double-1>", self._on_received_history_double_click)
+
+    def _populate_received_history(self):
+        tree = self.received_history_tree
+        tree.delete(*tree.get_children())
+        for row in list_received_history(self.conn, self.received_search_entry.get()):
+            try:
+                status = expiry_status(row["expiry"])
+            except ValueError:
+                status = ""
+            tree.insert("", "end", iid=str(row["id"]), values=(
+                row["name"], row["sku"] or "", row["supplier"], row["supplier_lot"], row["provenance"],
+                row["expiry"], row["barcode"], row["created_at"],
+            ), tags=(status,) if status else ())
+        self._reapply_tree_sort(tree)
+
+    def _submit_received_search(self, event=None):
+        self._hide_suggestions()
+        self._populate_received_history()
+        return "break"
+
+    def _clear_received_search(self, event=None):
+        self.received_search_entry.delete(0, tk.END)
+        self._submit_received_search()
+        self.received_search_entry.focus_set()
+        return "break"
+
+    def _on_received_search(self, event=None):
+        if event is not None and event.keysym in ("Up", "Down", "Tab", "Return", "Escape"):
+            return
+        self._populate_received_history()
+        term = self.received_search_entry.get().strip()
+        matches = list_received_history(self.conn, term, limit=8) if term else []
+        if not matches:
+            self._hide_suggestions()
+            return
+
+        def apply(row):
+            self.received_search_entry.delete(0, tk.END)
+            self.received_search_entry.insert(0, row["barcode"])
+            self._submit_received_search()
+            self.received_search_entry.focus_set()
+
+        labels = [f"{row['name']} [{row['sku'] or '-'}] | Lot {row['supplier_lot']} | {row['barcode']} | {row['created_at']}" for row in matches]
+        self._show_suggestions(self.received_search_entry, matches, labels, apply)
+
+    def _on_received_history_double_click(self, event):
+        iid = self.received_history_tree.identify_row(event.y)
+        if iid:
+            self._open_received_editor(int(iid))
 
     def _export_catalog(self):
         path = filedialog.asksaveasfilename(parent=self, title="Exportar catàleg de productes",
@@ -3661,6 +3895,8 @@ class TraceabilityApp(tk.Tk):
             sessions_panel, text="Exportar sessió actual", command=self.export_session, bg="#5a4db5", fg="white",
         )
         self.session_export_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.session_print_button = ttk.Button(sessions_panel, text="Imprimir sessió", command=self._print_session)
+        self.session_print_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         history_panel = tk.Frame(frame)
         history_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 10), pady=12)
@@ -3686,9 +3922,9 @@ class TraceabilityApp(tk.Tk):
         self.history_all_sessions_check.grid(row=1, column=2, sticky="w", padx=(8, 6))
         self.history_clear_button = tk.Button(search_row, text="✕", width=3, command=self._clear_history_search)
         self.history_clear_button.grid(row=1, column=3, sticky="e")
-        self.history_tree = ttk.Treeview(history_panel, columns=("Nom", "Lot envasat", "Lot proveïdor", "Caducitat", "Origen", "Quantitat", "Pes (kg)"), show="headings")
+        self.history_tree = ttk.Treeview(history_panel, columns=("Nom", "Lot envasat", "Lot d'entrada", "Caducitat", "Origen", "Quantitat", "Pes (kg)"), show="headings")
         self.history_tree.tag_configure("session_separator", background="#dce5e8", foreground="#25363c", font=("Segoe UI", 9, "bold"))
-        for text in ("Nom", "Lot envasat", "Lot proveïdor", "Caducitat", "Origen", "Quantitat", "Pes (kg)"):
+        for text in ("Nom", "Lot envasat", "Lot d'entrada", "Caducitat", "Origen", "Quantitat", "Pes (kg)"):
             self.history_tree.heading(text, text=text)
             self.history_tree.column(text, width=180)
         self.history_tree.grid(row=1, column=0, sticky="nsew")
@@ -3761,6 +3997,7 @@ class TraceabilityApp(tk.Tk):
     def refresh_materials(self):
         materials = list_raw_materials(self.conn)
         self.populate_received_table(materials)
+        self._populate_received_history()
 
     def populate_received_table(self, materials):
         self._hide_received_print_tooltip()
@@ -3881,7 +4118,7 @@ class TraceabilityApp(tk.Tk):
                 values=(
                     row["name"],
                     row["packed_lot"],
-                    row["supplier_lot"],
+                    row["supplier_lot"] if row["prepared_mixture_id"] is None else "",
                     row["expiry"],
                     row["provenance"],
                     row["quantity"],
@@ -3896,6 +4133,18 @@ class TraceabilityApp(tk.Tk):
         target_path = os.path.join(export_dir, f"sessio_{session_id}.csv")
         count = export_session_csv(self.conn, session_id, target_path)
         messagebox.showinfo("Exportació completada", f"S'han exportat {count} registres a:\n{target_path}")
+
+    def _print_session(self):
+        session_id = self.selected_session_id if self.selected_session_id is not None else self.session_id
+        directory = Path("output") / "sessions"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            rows = list_history_packaged_products(self.conn, session_id=session_id)
+            path = create_session_document(rows, session_id, directory / f"sessio_{session_id}.pdf")
+        except Exception as exc:
+            messagebox.showerror("Document no generat", str(exc), parent=self)
+            return
+        self._print_saved_labels([path])
 
     # ---- Desfer / refer ----
 

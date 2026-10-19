@@ -1,3 +1,14 @@
+def test_expiry_status_calendar_months():
+    from datetime import date
+    from src.core import expiry_status
+
+    today = date(2026, 11, 30)
+    assert expiry_status("2026-11-29", today) == "expired"
+    assert expiry_status("2026-11-30", today) == "expiring"
+    assert expiry_status("2027-02-27", today) == "expiring"
+    assert expiry_status("2027-02-28", today) == ""
+    assert expiry_status("", today) == ""
+
 from datetime import date
 
 import pytest

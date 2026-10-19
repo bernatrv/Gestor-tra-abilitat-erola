@@ -733,16 +733,285 @@ def test_label_files_survive_missing_or_failing_printer(tmp_path, monkeypatch):
     assert all(Path(path).is_file() for path in paths)
 
 
-def test_windows_print_escapes_apostrophes_and_checks_errors(tmp_path, monkeypatch):
+def test_windows_print_uses_selected_printer_without_shell(tmp_path, monkeypatch):
     if label_print.os.name != "nt":
         pytest.skip("Impressió de Windows")
     monkeypatch.setattr(label_print, "OUTPUT_DIR", str(tmp_path))
     run = Mock()
     monkeypatch.setattr(label_print.subprocess, "run", run)
+    backend = Mock()
+    monkeypatch.setattr(label_print, "print_label_windows", backend)
     path = label_print.create_packaged_label_image("Barreja d'arròs", "LOT-1", "", "2027-12-01")
     assert label_print.print_label_file(path, "Printer")["status"] == "printed"
-    assert "d''arròs" in run.call_args.args[0][-1]
-    assert run.call_args.kwargs["check"] is True
+    assert backend.call_args.args[:2] == (path, "Printer")
+    run.assert_not_called()
+    backend.side_effect = OSError("Offline")
+    assert label_print.print_label_file(path, "Printer")["status"] == "error"
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1200x760"])
+def test_received_history_all_rows_search_colors_and_editor(application, monkeypatch, size):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from src.db import list_received_history
+
+    app, app_module, printer = application
+    app.geometry(size)
+    upsert_catalog_rows(app.conn, [{"name": "Arròs", "sku": "00123", "weight": 1}], "test.csv")
+    expiries = [(date.today() - timedelta(days=1)).isoformat(), date.today().isoformat(), "2099-12-31"]
+    for index in range(25):
+        add_raw_material(app.conn, "Arròs", "Proveedor", f"ENTRY-{index:02}", "Catalunya", expiries[index % 3], f"BAR-{index:02}")
+    app.refresh_materials()
+    app.notebook.select(app.csv_tab)
+    app.products_notebook.select(app.received_history_tab)
+    app.focus_force()
+    app.update()
+    app._on_products_tab_changed()
+    assert app.focus_get() is app.received_search_entry
+    tree = app.received_history_tree
+    assert len(tree.get_children()) == 25
+    assert len(app.received_tree.get_children()) == 20
+    for row in list_received_history(app.conn):
+        expected = ("expired", "expiring", "")[int(row["barcode"][-2:]) % 3]
+        assert tuple(tree.item(str(row["id"]), "tags") or ()) == ((expected,) if expected else ())
+    for query in ("arros", "00123", "BAR-24", "ENTRY-24", date.today().isoformat(), date.today().strftime("%d/%m/%Y")):
+        app.received_search_entry.delete(0, "end")
+        app.received_search_entry.insert(0, query)
+        app._on_received_search()
+        assert tree.get_children(), query
+        assert app.suggestions_items, query
+    app.received_search_entry.delete(0, "end")
+    app.received_search_entry.insert(0, "ENTRY-24")
+    app._on_received_search()
+    suggestion = app.suggestions_items[0]
+    app.suggestions_apply(suggestion)
+    assert len(tree.get_children()) == 1
+    assert tree.set(tree.get_children()[0], "Codi de barres") == "BAR-24"
+    app._clear_received_search()
+    for column in tree["columns"]:
+        app._sort_tree_by_column(tree, column)
+        app._sort_tree_by_column(tree, column)
+    app.update()
+    iid = tree.get_children()[0]
+    tree.see(iid)
+    app.update()
+    bounds = tree.bbox(iid, "Nom")
+    editor = Mock()
+    monkeypatch.setattr(app, "_open_received_editor", editor)
+    app._on_received_history_double_click(SimpleNamespace(y=bounds[1] + bounds[3] // 2))
+    editor.assert_called_once_with(int(iid))
+    assert tree.winfo_rootx() + tree.winfo_width() <= app.winfo_rootx() + app.winfo_width()
+
+
+def test_packaging_expiry_warnings_simple_and_nested(application):
+    from datetime import timedelta
+
+    app, app_module, printer = application
+    expired = (date.today() - timedelta(days=1)).isoformat()
+    for expiry in (expired, date.today().isoformat()):
+        app._clear_package_form()
+        app.package_ingredients = [{"name": "Arròs", "sku": "001", "supplier_lot": "ENTRY", "provenance": "", "expiry": expiry}]
+        app.package_final_product = {"name": "Arròs", "sku": "001"}
+        app.package_quantity_entry.insert(0, "1")
+        app_module.messagebox.showwarning.reset_mock()
+        app._finalize_packaging_impl()
+        app_module.messagebox.showwarning.assert_called_once()
+        assert app_module.messagebox.showwarning.call_args.args[0] == "Avís de caducitat"
+        assert "ENTRY" in app_module.messagebox.showwarning.call_args.args[1]
+    mixture = add_prepared_mixture(app.conn, "Barreja", "002", "MIX-1", "2099-12-31", [
+        {"name": "Subbarreja", "expiry": "2099-12-31", "ingredients": [
+            {"name": "Ingredient caducat", "supplier_lot": "NESTED", "expiry": expired},
+        ]},
+    ])
+    app_module.messagebox.showwarning.reset_mock()
+    app._record_prepared_mixture_packaging(mixture, 1)
+    app_module.messagebox.showwarning.assert_called_once()
+    assert "NESTED" in app_module.messagebox.showwarning.call_args.args[1]
+    assert "CADUCAT" in app_module.messagebox.showwarning.call_args.args[1]
+    assert len(list_packaged_products(app.conn)) == 3
+
+
+def test_session_pdf_and_csv_include_input_lots_only_for_simple_products(application, monkeypatch, tmp_path):
+    import pymupdf
+
+    app, app_module, printer = application
+    monkeypatch.chdir(tmp_path)
+    for index in range(70):
+        add_packaged_product(app.conn, f"Producte {index}", f"LOT-{index}", "ENTRY-SIMPLE", "Catalunya", "2099-12-31", f"LOT-{index}", 2, .25, app.session_id, [], "001")
+    mixture = add_prepared_mixture(app.conn, "Barreja", "002", "MIX-1", "2099-12-31", [{"name": "Ingredient", "expiry": "2099-12-31"}])
+    add_packaged_product(app.conn, "Barreja", "MIX-1", "HIDDEN-MIX-LOT", "", "2099-12-31", "MIX-1", 1, 1, app.session_id, [], "002", mixture["id"])
+    app.search_var.insert(0, "No match")
+    app._print_session()
+    path, selected_printer = printer.call_args.args
+    assert selected_printer is None
+    with pymupdf.open(path) as document:
+        assert len(document) > 1
+        text = "".join(page.get_text() for page in document)
+        assert "ENTRY-SIMPLE" in text
+        assert "HIDDEN-MIX-LOT" not in text
+        assert "Producte 69" in text
+        assert document[0].rect.width > document[0].rect.height
+    csv_path = tmp_path / "session.csv"
+    export_session_csv(app.conn, app.session_id, str(csv_path))
+    with csv_path.open(encoding="utf-8-sig", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 71
+    assert next(row for row in rows if row["nom"] == "Barreja")["lot_entrada"] == ""
+    app.search_var.delete(0, "end")
+    app.refresh_history()
+    for iid in app.history_tree.get_children():
+        values = app.history_tree.item(iid, "values")
+        assert values[2] == ("" if values[0] == "Barreja" else "ENTRY-SIMPLE")
+
+
+@pytest.mark.parametrize("status", ["cancelled", "opened"])
+def test_a4_cancel_is_not_printer_failure(application, tmp_path, status):
+    app, app_module, printer = application
+    printer.return_value = {"status": status}
+    assert app._print_saved_labels([str(tmp_path / "document.pdf")])["status"] == status
+    app._show_label_saved_notice.assert_not_called()
+    app_module.messagebox.showwarning.assert_not_called()
+
+
+@pytest.mark.parametrize("size", ["760x500", "980x620"])
+def test_template_manager_opens_without_changing_receipt_printing(application, size):
+    from src.label_templates import load_template_config
+
+    app, app_module, printer = application
+    dialog = app._show_template_manager()
+    assert dialog is not None
+    dialog.geometry(size)
+    dialog.update()
+    assert app.grab_current() is dialog
+    assert len(dialog.notebook.tabs()) == 2
+    assert not load_template_config(app.conn)["enabled"]
+    for tab in dialog.notebook.tabs():
+        dialog.notebook.select(tab)
+        dialog.update()
+        for panel in (dialog, *dialog.winfo_children()):
+            for widget in panel.winfo_children():
+                if widget.winfo_ismapped():
+                    assert widget.winfo_rootx() + widget.winfo_width() <= dialog.winfo_rootx() + dialog.winfo_width()
+                    assert widget.winfo_rooty() + widget.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+    dialog.destroy()
+    app._print_received_material({"name": "Arros", "supplier_lot": "L-1", "provenance": "", "expiry": "2099-12-01", "barcode": "12345", "supplier": "Supplier"})
+    assert printer.call_args.args[0].endswith(".png")
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_packaging_uses_assigned_template_and_preserves_saved_job(application, monkeypatch, tmp_path, prepared):
+    import zipfile
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    path = tmp_path / "Bossa.lbx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/><objectStyle objectName="Lot"/></label>')
+    identity = templates.import_label_template(app.conn, path)
+    templates.configure_label_template(app.conn, identity, "Bossa", {"Producte": "producte", "Lot": "lot"})
+    templates.assign_product_template(app.conn, [{"sku": "001", "name": "Arros"}], identity)
+    templates.set_templates_enabled(app.conn, True)
+    backend = Mock(return_value={"status": "printed"})
+    monkeypatch.setattr(app_module, "print_template_job", backend)
+    if prepared:
+        mixture = add_prepared_mixture(app.conn, "Arros", "001", "MIX-TEMPLATE", "2099-12-31", [{"name": "Ingredient", "expiry": "2099-12-31"}])
+        app._record_prepared_mixture_packaging(mixture, 3)
+    else:
+        app.package_ingredients = [{"name": "Arros", "sku": "001", "supplier_lot": "ENTRY-1", "provenance": "Catalunya", "expiry": "2099-12-31"}]
+        app.package_final_product = {"name": "Arros", "sku": "001"}
+        app.package_quantity_entry.insert(0, "3")
+        app._finalize_packaging_impl()
+    assert len(list_packaged_products(app.conn)) == 1
+    backend.assert_called_once()
+    printer.assert_not_called()
+    job_path = backend.call_args.args[0]
+    with open(job_path, encoding="utf-8") as source:
+        job = json.load(source)
+    assert job["copies"] == 3
+    assert job["values"]["producte"] == "Arros"
+    assert job["template"]["fields"] == {"Producte": "producte", "Lot": "lot"}
+    snapshot = job["template"]["content"]
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Updated"/></label>')
+    templates.import_label_template(app.conn, path, identity)
+    with open(job_path, encoding="utf-8") as source:
+        assert json.load(source)["template"]["content"] == snapshot
+    backend.return_value = {"status": "error", "message": "b-PAC missing"}
+    app._print_saved_labels([job_path])
+    assert app_module.messagebox.showwarning.call_args.args[0] == "Plantilla no impresa"
+    assert len(list_packaged_products(app.conn)) == 1
+
+
+def test_template_manager_import_maps_fields_and_assigns_product(application, monkeypatch, tmp_path):
+    import zipfile
+    import src.template_manager as manager_module
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    upsert_catalog_rows(app.conn, [{"name": "Arros", "sku": "001", "weight": 1}], "test.csv")
+    path = tmp_path / "Bossa.lbx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/></label>')
+    monkeypatch.setattr(manager_module.filedialog, "askopenfilenames", Mock(return_value=[str(path)]))
+    dialog = app._show_template_manager()
+    dialog._import()
+    identity = dialog.templates_tree.selection()[0]
+    dialog.object_name.set("Producte")
+    dialog.field_name.set("Nom del producte")
+    dialog._save_field()
+    dialog.notebook.select(1)
+    dialog.update()
+    dialog.products_tree.selection_set(dialog.products_tree.get_children())
+    dialog.product_template.set(next(label for label, value in dialog._template_choices.items() if value == identity))
+    dialog._assign()
+    dialog.enabled.set(True)
+    dialog._set_enabled()
+    template = templates.get_product_template(app.conn, "001", "Arros")
+    assert template["fields"] == {"Producte": "producte"}
+    dialog.destroy()
+    app.undo_action()
+    assert not templates.load_template_config(app.conn)["enabled"]
+
+
+def test_missing_template_does_not_print_generic_or_lose_packaging(application):
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    templates.set_templates_enabled(app.conn, True)
+    app.package_ingredients = [{"name": "Arros", "sku": "001", "supplier_lot": "ENTRY-1", "provenance": "", "expiry": "2099-12-31"}]
+    app.package_final_product = {"name": "Arros", "sku": "001"}
+    app.package_quantity_entry.insert(0, "2")
+    app._finalize_packaging_impl()
+    assert len(list_packaged_products(app.conn)) == 1
+    printer.assert_not_called()
+    assert "no té cap plantilla" in app_module.messagebox.showwarning.call_args.args[1]
+
+
+def test_label_print_menu_persists_printer_and_dimensions(application, monkeypatch, tmp_path):
+    from src import printing
+
+    app, app_module, printer = application
+    monkeypatch.setattr(printing, "SETTINGS_PATH", tmp_path / "printing.json")
+    monkeypatch.setattr(app_module, "list_printers", Mock(return_value=["Brother QL-600", "ColorWorks"]))
+    preferences = Mock()
+    monkeypatch.setattr(app_module, "printer_preferences", preferences)
+    app._show_label_print_settings()
+    dialog = app.grab_current()
+    combo = next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Combobox))
+    combo.set("ColorWorks")
+    next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Button)).invoke()
+    preferences.assert_called_once_with("ColorWorks", dialog.winfo_id())
+    next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Checkbutton)).invoke()
+    inputs = [child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Spinbox)]
+    for entry, value in zip(inputs, ("80", "50")):
+        entry.delete(0, "end")
+        entry.insert(0, value)
+    buttons = next(child for child in dialog.winfo_children() if isinstance(child, app_module.tk.Frame))
+    next(child for child in buttons.winfo_children() if child.cget("text") == "Desar").invoke()
+    assert app.printer_name == "ColorWorks"
+    assert printing.load_label_settings() == {"printer": "ColorWorks", "custom_size": True, "width_mm": 80, "height_mm": 50}
+    app._open_database(str(tmp_path / "other.db"))
+    assert app.printer_name == "ColorWorks"
 
 
 @pytest.mark.parametrize("count", [10, 60])
@@ -1361,12 +1630,12 @@ def test_pane_drag_defers_content_resize_until_release(application, offset):
         assert str(panes.cget("sashrelief")) == "flat"
         assert panes.winfo_rgb(panes.cget("background")) != panes.winfo_rgb("#999999")
         line = panes._sash_lines[0]
-        assert line.cget("background") == "#999999"
+        assert panes.winfo_rgb(line.cget("background")) == panes.winfo_rgb(panes.cget("background"))
         horizontal = str(panes.cget("orient")) == "horizontal"
         assert (line.winfo_width() if horizontal else line.winfo_height()) == 2
         assert int(panes.cget("proxyborderwidth")) == 0
         assert str(panes.cget("proxyrelief")) == "flat"
-        assert panes.cget("proxybackground") == "#666666"
+        assert panes.winfo_rgb(panes.cget("proxybackground")) == panes.winfo_rgb(panes.cget("background"))
         children = [app.nametowidget(name) for name in panes.panes()]
         before = [(child.winfo_width(), child.winfo_height()) for child in children]
         sash_x, sash_y = panes.sash_coord(0)
@@ -1526,10 +1795,12 @@ def test_prepared_history_prints_production_sheet_without_changing_records(appli
         assert handle.read(5) == b"%PDF-"
     assert app.conn.serialize() == before
     assert not app.history.can_undo
+    app._show_label_saved_notice.assert_not_called()
+    assert printer.call_args.args[1] is None
     if status == "printed":
-        app._show_label_saved_notice.assert_not_called()
+        app_module.messagebox.showwarning.assert_not_called()
     else:
-        app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
+        assert app_module.messagebox.showwarning.call_args.args[0] == "Document no imprès"
 
 
 @pytest.mark.parametrize("size", ["1000x550", "1200x760"])
@@ -1729,7 +2000,8 @@ def test_preparation_survives_print_failure(application, monkeypatch):
     prepare_form(app)
     app._finalize_packaging()
     assert len(list_prepared_mixtures(app.conn)) == 1
-    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
+    app._show_label_saved_notice.assert_not_called()
+    assert app_module.messagebox.showwarning.call_args.args[0] == "Document no imprès"
     assert app.conn.execute("SELECT COUNT(*) FROM packaged_products").fetchone()[0] == 0
 
 
@@ -1885,13 +2157,13 @@ from src.history import ActionHistory, Snapshot
 def test_export_session_csv_includes_quantity_and_weight(tmp_path):
     conn = initialize_db(str(tmp_path / "test.db"))
     try:
-        add_packaged_product(conn, "Te", "LOT-1", "", "Cat", "2027-01-01", "LOT-1", 7, 0.25, 5, [], "1")
+        add_packaged_product(conn, "Te", "LOT-1", "ENTRADA-1", "Cat", "2027-01-01", "LOT-1", 7, 0.25, 5, [], "1")
         target = tmp_path / "out.csv"
         assert export_session_csv(conn, 5, str(target)) == 1
         with open(target, encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.reader(handle))
-        assert rows[0] == ["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg"]
-        assert rows[1] == ["Te", "LOT-1", "2027-01-01", "Cat", "7", "0.25"]
+        assert rows[0] == ["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg", "lot_entrada"]
+        assert rows[1] == ["Te", "LOT-1", "2027-01-01", "Cat", "7", "0.25", "ENTRADA-1"]
     finally:
         conn.close()
 

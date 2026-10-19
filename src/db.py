@@ -874,6 +874,31 @@ def list_raw_materials(conn: sqlite3.Connection):
     ).fetchall()
 
 
+def list_received_history(conn, term="", limit=None):
+    rows = conn.execute(
+        "SELECT rm.*, (SELECT pc.sku FROM product_catalog pc "
+        "WHERE LOWER(TRIM(pc.name)) = LOWER(TRIM(rm.name)) "
+        "ORDER BY pc.created_at DESC, pc.id DESC LIMIT 1) AS sku "
+        "FROM raw_materials rm ORDER BY rm.created_at DESC, rm.id DESC"
+    ).fetchall()
+    searchable = []
+    for row in rows:
+        item = dict(row)
+        item["dates"] = " ".join(
+            f"{value[8:10]}-{value[5:7]}-{value[:4]} {value[8:10]}/{value[5:7]}/{value[:4]}"
+            for value in (row["expiry"] or "", row["created_at"] or "") if len(value) >= 10
+        )
+        searchable.append(item)
+    if not term.strip():
+        return searchable[:limit]
+    exact = [row for row in searchable if _suggestion_key(row["barcode"]) == _suggestion_key(term)]
+    if exact:
+        return exact[:limit]
+    return _rank_suggestions(searchable, term,
+                             ("name", "sku", "barcode", "supplier_lot", "created_at", "expiry", "supplier", "provenance", "dates"),
+                             limit)
+
+
 def list_packaged_products(conn: sqlite3.Connection):
     return conn.execute(
         "SELECT p.*, m.barcode AS prepared_mixture_barcode FROM packaged_products p "
@@ -907,15 +932,15 @@ def search_packaged(conn: sqlite3.Connection, term: str):
 
 def export_session_csv(conn: sqlite3.Connection, session_id: int, target_path: str):
     rows = conn.execute(
-        "SELECT name, packed_lot AS lot, expiry AS caducitat, provenance AS origen, quantity AS quantitat, weight AS pes_kg FROM packaged_products WHERE session_id = ? ORDER BY created_at DESC",
+        "SELECT name, packed_lot AS lot, expiry AS caducitat, provenance AS origen, quantity AS quantitat, weight AS pes_kg, CASE WHEN prepared_mixture_id IS NULL THEN supplier_lot ELSE '' END AS lot_entrada FROM packaged_products WHERE session_id = ? ORDER BY created_at DESC",
         (session_id,),
     ).fetchall()
 
     with open(target_path, "w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg"])
+        writer.writerow(["nom", "lot", "caducitat", "origen", "quantitat", "pes_kg", "lot_entrada"])
         for row in rows:
-            writer.writerow([row["name"], row["lot"], row["caducitat"], row["origen"], row["quantitat"], row["pes_kg"]])
+            writer.writerow([row["name"], row["lot"], row["caducitat"], row["origen"], row["quantitat"], row["pes_kg"], row["lot_entrada"]])
 
     return len(rows)
 

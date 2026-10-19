@@ -4,9 +4,9 @@ Aquest projecte és una aplicació de Windows/Linux per gestionar la traçabilit
 
 ## Versions del programa
 
-La versió actual és **0.1.0-alpha.2**. El número es desa a `VERSION` i els paquets de cada versió es conserven en una carpeta separada dins de `versions/`, sense sobreescriure les anteriors. Consulta [l'historial de versions](versions/README.md) per veure les novetats i el procés de publicació.
+La versió actual és **0.1.0-alpha.3**. El número es desa a `VERSION` i els paquets de cada versió es conserven en una carpeta separada dins de `versions/`, sense sobreescriure les anteriors. Consulta [l'historial de versions](versions/README.md) per veure les novetats i el procés de publicació.
 
-Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'executable de Windows i el ZIP de fonts per a Linux amb la versió al nom, juntament amb les sumes SHA-256. No inclou les dades de l'usuari. Per publicar la següent alfa, actualitza `VERSION` a `0.1.0-alpha.3` i afegeix les novetats a l'historial abans d'executar el script.
+Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'executable de Windows i el ZIP de fonts per a Linux amb la versió al nom, juntament amb les sumes SHA-256. No inclou les dades de l'usuari. Per publicar la següent alfa, actualitza `VERSION` a `0.1.0-alpha.4` i afegeix les novetats a l'historial abans d'executar el script.
 
 ## Funcionalitats principals
 
@@ -21,7 +21,10 @@ Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'e
 - Avís de productes fora del catàleg amb suggeriments aproximats i alta de productes nous.
 - Edició i unificació de proveïdors i orígens a tota la base de dades.
 - Generació automàtica de lot d'envasat i càlcul de la caducitat mínima.
-- Impressió d'etiquetes cap a la impressora Epson ColorWorks CW-C4000e si la impressora està configurada a l'ordinador.
+- Impressió automàtica d'etiquetes amb Brother QL-600 o altres impressores instal·lades, com Epson ColorWorks.
+- Productes amb subpestanyes Catàleg i Rebuts, amb historial complet, cerca, ordenació i edició de recepcions.
+- Avisos en envasar productes caducats o que caduquen en menys de tres mesos naturals, també ingredients de barreges niades.
+- Fulls de producció i sessions en PDF A4 amb diàleg estàndard d'impressió de Windows.
 - Base de dades SQLite amb historial complet.
 - Cerca i exportació de la sessió actual.
 
@@ -48,11 +51,34 @@ Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'e
 
 ## Configuració de la impressora
 
-La impressora d'etiquetes es configura des del programa en la pestanya d'envasat si et cal. Si la impressora està connectada i disponible al sistema, el programa intenta enviar la feina d'impressió. Els fitxers es desen sempre a `output/labels`, també si no hi ha impressora o falla l'enviament, i es poden imprimir manualment.
+El menú **Impressió > Configurar etiquetes...** permet seleccionar una impressora instal·lada i, opcionalment, definir amplada i alçada en mil·límetres. La impressora inicial és **Brother QL-600**. Instal·la el controlador oficial de Brother i selecciona el rotlle real a **Preferències del controlador...**, on també es configuren el tall i la resta d'opcions del fabricant. Aquestes preferències es desen per a l'usuari de Windows i poden afectar altres aplicacions que utilitzin la mateixa impressora. Sense mida personalitzada, es respecta el paper definit al controlador. Una mida personalitzada no compatible es rebutja en imprimir; no es força un format que el controlador no accepti.
+
+Les etiquetes de recepció i envasat s'envien automàticament, sense diàleg per unitat, a la cua de la impressora seleccionada mitjançant Windows GDI i el controlador del fabricant. Cada imatge s'ajusta proporcionalment a l'àrea imprimible, sense retallar el contingut. El mateix sistema permet triar una Epson ColorWorks quan estigui instal·lada. La configuració es desa a `data/printing.json`, independentment de la base de dades, i es manté en reiniciar. A Linux s'utilitza CUPS (`lp`); les preferències del controlador es gestionen amb les eines de CUPS.
+
+Els documents PDF A4 no s'envien a la impressora d'etiquetes: a Windows obren el diàleg natiu amb selecció d'impressora, còpies, interval de pàgines i propietats del controlador. No cal tenir cap visor PDF associat: PyMuPDF renderitza les pàgines i GDI les envia a la cua. Cancel·lar el diàleg no és un error. A Linux s'obre el visor PDF del sistema per imprimir des d'allà.
+
+Els fitxers es desen sempre abans d'imprimir, també si no hi ha impressora o falla l'enviament. Confirmar l'enviament a la cua no garanteix la sortida física: paper, connexió i incidències del dispositiu es consulten a la cua de Windows.
 
 Cada etiqueta té un nom únic amb producte, lot, data i hora, inclosos microsegons i un sufix per evitar col·lisions, per exemple `Farina_LOT-1_20261015_123045_123456_a1b2c3d4.png`. Els caràcters no vàlids per a noms de fitxer es substitueixen. Les reimpressions no sobreescriuen etiquetes anteriors. Si es demanen diverses unitats, es desa un fitxer per unitat abans de començar a imprimir.
 
-### Formats impresos
+### Plantilles P-touch per tipus d'envàs
+
+**Impressió > Plantilles d'envasat...** permet gestionar dissenys `.lbx` de P-touch Editor. Només afecta les etiquetes d'envasat: les recepcions i els fulls A4 conserven el sistema actual.
+
+1. A **Plantilles**, prem **Importar...** i selecciona els fitxers originals. Cada plantilla representa un tipus d'envàs; pots canviar-ne el nom sense modificar el fitxer original.
+2. Selecciona una plantilla i relaciona els seus noms d'objecte P-touch amb dades del programa: nom del producte, SKU, lot d'envasat, caducitat ISO o dia/mes/any, origen, pes, data d'envasat o codi de l'envasat. **Desar camp** aplica cada relació. Els objectes no relacionats es mantenen fixos, inclosos logotips, textos i imatges. Si un nom no s'ha detectat, es pot introduir manualment; ha de coincidir exactament amb el nom d'objecte definit a P-touch Editor. No és el text visible de l'etiqueta. Cal configurar almenys un camp variable abans d'imprimir per evitar enviar textos de mostra.
+3. A **Productes**, cerca i selecciona un o diversos productes, tria el tipus d'envàs i prem **Assignar als seleccionats**. L'associació utilitza el SKU quan n'hi ha; si no, el nom del producte. Si es modifica aquesta identificació al catàleg, cal revisar-ne l'assignació.
+4. Activa **Utilitzar plantilles P-touch per als envasats**. A partir d'aleshores, s'utilitza automàticament el disseny assignat tant per a productes simples com per a barreges preparades. Si falta una assignació o un objecte variable, no s'imprimeix una etiqueta genèrica en substitució: apareix un avís i l'envasat continua registrat.
+
+**Substituir...** actualitza el disseny mantenint el tipus d'envàs, els camps i les associacions amb productes. Si el nou disseny canvia els noms d'objecte, cal actualitzar-ne les relacions. **Editar a P-touch** obre una còpia de treball amb l'editor associat al sistema; després de desar al mateix fitxer i tancar l'editor, **Recollir canvis** incorpora el disseny actualitzat. La maquetació es fa amb P-touch Editor, no amb un editor de dissenys propi del programa. També es poden exportar els originals o eliminar plantilles que no tinguin productes assignats.
+
+Els dissenys i les associacions es desen dins de la base de dades, sense dependre de la ubicació dels fitxers importats, i s'inclouen a **Desar com** i a desfer/refer. Les còpies de treball de l'editor es desen a `data/template_edits`; no s'eliminen automàticament, per no perdre una edició oberta.
+
+La impressió de plantilles requereix **Windows, una Brother compatible, el controlador oficial i el component Brother b-PAC** de la mateixa arquitectura que l'aplicació (32 o 64 bits). P-touch Editor només és necessari per modificar el disseny. b-PAC s'instal·la per separat des de [Brother](https://support.brother.com/g/s/es/dev/en/bpac/download/index.html); no està inclòs a les dependències Python. La mida i el disseny es defineixen a la plantilla i cal que siguin compatibles amb el rotlle i el controlador. Aquest motor no és una solució per imprimir `.lbx` amb Epson ColorWorks ni des de Linux; es pot desactivar per continuar amb les etiquetes genèriques.
+
+Abans d'enviar una feina es desa un JSON a `output/labels` amb la plantilla completa, els valors i el nombre de còpies. **Impressió > Reimprimir feina de plantilla...** permet tornar-la a enviar, fins i tot després de canviar la plantilla actual, sense crear nous registres d'envasament. Cal comprovar la cua abans de repetir una feina fallida per evitar duplicats si se n'ha imprès una part.
+
+### Formats impresos sense plantilla
 
 - **Recepció (PNG, 300 ppp):** nom complet del producte, proveïdor, lot d'entrada, origen si està informat, caducitat i codi de barres Code128 amb el valor llegible a sota.
 - **Envasat (PNG, 300 ppp):** nom complet del producte, número de lot, consum preferent i pes net per unitat en kg; origen només si està informat. No inclou codi de barres ni les dades de recepció.
@@ -60,7 +86,7 @@ Cada etiqueta té un nom únic amb producte, lot, data i hora, inclosos microseg
 
 El full de recepta es genera en confirmar la impressió de traçabilitat quan es prepara una barreja a Envasat; no en desar només la definició d'una recepta sense ingredients rebuts ni lot de producció.
 
-Si no es pot imprimir, l'avís mostra «No s'ha trobat impressora, etiqueta guardada a» i el directori clicable on s'ha desat. L'enllaç obre l'explorador de fitxers del sistema, tant a Windows com a Linux (mitjançant `xdg-open`). També s'aplica al full de barreja.
+Si no es pot imprimir una etiqueta, l'avís mostra «No s'ha trobat impressora, etiqueta guardada a» i el directori clicable on s'ha desat. L'enllaç obre l'explorador de fitxers del sistema, tant a Windows com a Linux (mitjançant `xdg-open`). Si falla un document A4, l'avís mostra el motiu i el camí del PDF conservat.
 
 El checkbox «No mostrar més avisos d'impressora durant aquesta sessió» silencia aquests avisos fins que s'inicia una nova sessió (en reiniciar el programa o obrir una base de dades). Les etiquetes es continuen generant i desant, i el programa continua intentant imprimir-les.
 
@@ -119,6 +145,10 @@ L'Intro del teclat numèric té el mateix comportament que l'Intro normal, tamb�
 
 ### Catàleg de productes
 
+La pestanya **Productes** conté **Catàleg** i **Rebuts**. Rebuts mostra totes les recepcions, no només les 20 més recents de Recepció: nom, SKU del catàleg actual, proveïdor, lot d'entrada, origen, caducitat, codi de barres i data de recepció. La cerca compartida amb suggeriments admet noms sense accents, SKU, codis, lots i dates ISO o dia/mes/any. Clicar una capçalera ordena la columna en tots dos sentits; fer doble clic en una fila obre «Modificar recepció».
+
+Les recepcions caducades es mostren en vermell i les que caduquen en menys de tres mesos naturals en taronja. El dia de caducitat es considera dins l'avís, però no caducat fins l'endemà. El mateix criteri s'aplica als avisos d'envasament, inclosos els ingredients niats d'una barreja. L'avís informa, però no bloqueja el registre de l'envasament.
+
 En confirmar un nom que no coincideix amb cap producte del catàleg, apareix un avís amb els noms més semblants. Un doble clic sobre una alternativa substitueix el nom introduït. També es pot seleccionar una alternativa i prémer Intro o «Seleccionar».
 
 El mateix diàleg permet crear un producte amb SKU, nom, pes en kg i categoria. Només el nom és obligatori; el pes buit es desa sense valor, no com un pes zero. Els SKU es conserven com a text, inclosos els zeros inicials. No es permet crear un producte amb un nom o SKU ja existent. Cancel·lar conserva el text original. La comprovació es fa en confirmar el nom a Recepció i Envasat, i en confirmar el producte o desar els ingredients d'una recepta; també s'aplica a Recepció ràpida.
@@ -148,6 +178,8 @@ La cerca i els suggeriments també inclouen els ingredients de cada envasat, inc
 El botó «✕» neteja el text, tanca els suggeriments i torna a mostrar els registres sense filtre de text, mantenint l'estat de «Totes les sessions».
 
 El botó sota la llista mostra «Exportar sessió actual» quan està seleccionada la sessió actual i «Exportar sessió seleccionada» en qualsevol altra. Exporta tots els envasats d'aquella sessió, encara que la cerca en mostri només una part o estigui activada la cerca global, a `output/sessions/sessio_<id>.csv`. En obrir una altra base de dades se selecciona la seva nova sessió actual.
+
+El CSV incorpora `lot_entrada`, amb el lot del proveïdor per als productes simples i buit per a les barreges vinculades a un full de producció. La taula de l'historial mostra «Lot d'entrada» amb el mateix criteri. **Imprimir sessió** genera també `output/sessions/sessio_<id>.pdf`, amb tots els registres de la sessió seleccionada independentment de la cerca, en A4 horitzontal amb capçalera repetida i pàgines numerades, i obre el diàleg d'impressió estàndard.
 
 ### Editar i reimprimir recepcions
 
