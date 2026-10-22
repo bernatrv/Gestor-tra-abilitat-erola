@@ -1,17 +1,18 @@
 # erola producció
 
-Aquest projecte és una aplicació de Windows/Linux per gestionar la traçabilitat de materials i productes envasats.
+Aquest projecte és una aplicació per a Windows per gestionar la traçabilitat de materials i productes envasats.
 
 ## Versions del programa
 
-La versió actual és **0.1.0-alpha.3**. El número es desa a `VERSION` i els paquets de cada versió es conserven en una carpeta separada dins de `versions/`, sense sobreescriure les anteriors. Consulta [l'historial de versions](versions/README.md) per veure les novetats i el procés de publicació.
+La versió actual és **0.1.0-alpha.4**. El número es desa a `VERSION` i els paquets de cada versió es conserven en una carpeta separada dins de `versions/`, sense sobreescriure les anteriors. Consulta [l'historial de versions](versions/README.md) per veure les novetats i el procés de publicació.
 
-Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'executable de Windows i el ZIP de fonts per a Linux amb la versió al nom, juntament amb les sumes SHA-256. No inclou les dades de l'usuari. Per publicar la següent alfa, actualitza `VERSION` a `0.1.0-alpha.4` i afegeix les novetats a l'historial abans d'executar el script.
+Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'executable de Windows amb la versió al nom, juntament amb la suma SHA-256. No inclou les dades de l'usuari. Per publicar la següent alfa, actualitza `VERSION` a `0.1.0-alpha.5` i afegeix les novetats a l'historial abans d'executar el script.
 
 ## Funcionalitats principals
 
 - Alta de productes rebuts amb nom, lot, procedència i caducitat.
 - Reimpressió i edició de recepcions, conservant el codi de barres original.
+- Recepció amb impressió automàtica, sense preguntar si es vol imprimir ni mostrar una confirmació de registre. Es mantenen els avisos si falta impressora, plantilla assignada o falla la impressió.
 - Importació i exportació de múltiples receptes en JSON UTF-8.
 - Etiquetatge amb codi de barres en format Code128.
 - Envasat d'un producte amb una o diverses matèries primeres i quantitat.
@@ -31,19 +32,15 @@ Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'e
 ## Requisits
 
 - Python 3.11 o superior.
-- Windows 10/11 o Linux.
-- Una impressora d'etiquetes compatible amb CUPS o Windows Printer Driver (opcional).
+- Windows 10/11.
+- Una impressora d'etiquetes amb controlador de Windows (opcional).
 
 ## Instal·lació
 
 1. Obre una terminal dins de la carpeta del projecte.
 2. Crea un entorn virtual i activa'l:
-   - Windows:
-     - `python -m venv .venv`
-     - `.venv\Scripts\activate`
-   - Linux/macOS:
-     - `python3 -m venv .venv`
-     - `source .venv/bin/activate`
+   - `python -m venv .venv`
+   - `.venv\Scripts\activate`
 3. Installa les dependències:
    - `pip install -r requirements.txt`
 4. Executa l'aplicació:
@@ -51,30 +48,30 @@ Des de PowerShell a Windows, `./build_release.ps1` executa les proves i crea l'e
 
 ## Configuració de la impressora
 
-El menú **Impressió > Configurar etiquetes...** permet seleccionar una impressora instal·lada i, opcionalment, definir amplada i alçada en mil·límetres. La impressora inicial és **Brother QL-600**. Instal·la el controlador oficial de Brother i selecciona el rotlle real a **Preferències del controlador...**, on també es configuren el tall i la resta d'opcions del fabricant. Aquestes preferències es desen per a l'usuari de Windows i poden afectar altres aplicacions que utilitzin la mateixa impressora. Sense mida personalitzada, es respecta el paper definit al controlador. Una mida personalitzada no compatible es rebutja en imprimir; no es força un format que el controlador no accepti.
+El menú **Impressió > Configurar impressores...** té apartats separats per a l'etiquetadora i la impressora normal A4. Selecciona manualment cada cua; el nom inclou el port, per distingir, per exemple, la Brother connectada per USB d'una cua `FILE:`. Per a l'etiquetadora indica l'amplada del rotlle i la llargada de l'etiqueta en mil·límetres. Aquestes dimensions s'apliquen explícitament a la feina; no es detecta automàticament la mida del rotlle. Si el controlador no accepta el format introduït, la impressió s'atura amb un error. Les preferències del controlador permeten configurar el tall, la qualitat i altres opcions del fabricant; a Windows es desen per a l'usuari i poden afectar altres aplicacions que utilitzin la mateixa cua.
 
-Les etiquetes de recepció i envasat s'envien automàticament, sense diàleg per unitat, a la cua de la impressora seleccionada mitjançant Windows GDI i el controlador del fabricant. Cada imatge s'ajusta proporcionalment a l'àrea imprimible, sense retallar el contingut. El mateix sistema permet triar una Epson ColorWorks quan estigui instal·lada. La configuració es desa a `data/printing.json`, independentment de la base de dades, i es manté en reiniciar. A Linux s'utilitza CUPS (`lp`); les preferències del controlador es gestionen amb les eines de CUPS.
+Les recepcions utilitzen sempre una plantilla P-touch, tant en registrar-les com en reimprimir-les des de Productes > Rebuts o des del seu editor. Les etiquetes genèriques d'envasat, quan les plantilles estan desactivades, s'envien automàticament, sense diàleg per unitat, a l'etiquetadora seleccionada mitjançant Windows GDI i el controlador del fabricant. El programa torna a maquetar els textos i el codi de barres a l'amplada i la llargada indicades manualment. Les dades dels PNG anteriors es conserven per poder-los reimprimir; les plantilles P-touch conserven la seva mida pròpia. Als documents A4, el diàleg estàndard de Windows s'obre amb la impressora normal seleccionada, i encara permet canviar-la, les còpies i les pàgines. La configuració es desa a `data/printing.json`, independentment de la base de dades, i es manté en reiniciar. Les plantilles P-touch requereixen b-PAC.
 
-Els documents PDF A4 no s'envien a la impressora d'etiquetes: a Windows obren el diàleg natiu amb selecció d'impressora, còpies, interval de pàgines i propietats del controlador. No cal tenir cap visor PDF associat: PyMuPDF renderitza les pàgines i GDI les envia a la cua. Cancel·lar el diàleg no és un error. A Linux s'obre el visor PDF del sistema per imprimir des d'allà.
+Els documents PDF A4 no s'envien a la impressora d'etiquetes: a Windows obren el diàleg natiu amb selecció d'impressora, còpies, interval de pàgines i propietats del controlador. No cal tenir cap visor PDF associat: PyMuPDF renderitza les pàgines i GDI les envia a la cua. Cancel·lar el diàleg no és un error.
 
 Els fitxers es desen sempre abans d'imprimir, també si no hi ha impressora o falla l'enviament. Confirmar l'enviament a la cua no garanteix la sortida física: paper, connexió i incidències del dispositiu es consulten a la cua de Windows.
 
 Cada etiqueta té un nom únic amb producte, lot, data i hora, inclosos microsegons i un sufix per evitar col·lisions, per exemple `Farina_LOT-1_20261015_123045_123456_a1b2c3d4.png`. Els caràcters no vàlids per a noms de fitxer es substitueixen. Les reimpressions no sobreescriuen etiquetes anteriors. Si es demanen diverses unitats, es desa un fitxer per unitat abans de començar a imprimir.
 
-### Plantilles P-touch per tipus d'envàs
+### Plantilles P-touch d'etiquetes
 
-**Impressió > Plantilles d'envasat...** permet gestionar dissenys `.lbx` de P-touch Editor. Només afecta les etiquetes d'envasat: les recepcions i els fulls A4 conserven el sistema actual.
+**Impressió > Plantilles d'etiquetes...** permet gestionar dissenys `.lbx` de P-touch Editor per a recepcions i envasats. Els fulls de producció i les sessions A4 no canvien.
 
-1. A **Plantilles**, prem **Importar...** i selecciona els fitxers originals. Cada plantilla representa un tipus d'envàs; pots canviar-ne el nom sense modificar el fitxer original.
-2. Selecciona una plantilla i relaciona els seus noms d'objecte P-touch amb dades del programa: nom del producte, SKU, lot d'envasat, caducitat ISO o dia/mes/any, origen, pes, data d'envasat o codi de l'envasat. **Desar camp** aplica cada relació. Els objectes no relacionats es mantenen fixos, inclosos logotips, textos i imatges. Si un nom no s'ha detectat, es pot introduir manualment; ha de coincidir exactament amb el nom d'objecte definit a P-touch Editor. No és el text visible de l'etiqueta. Cal configurar almenys un camp variable abans d'imprimir per evitar enviar textos de mostra.
-3. A **Productes**, cerca i selecciona un o diversos productes, tria el tipus d'envàs i prem **Assignar als seleccionats**. L'associació utilitza el SKU quan n'hi ha; si no, el nom del producte. Si es modifica aquesta identificació al catàleg, cal revisar-ne l'assignació.
-4. Activa **Utilitzar plantilles P-touch per als envasats**. A partir d'aleshores, s'utilitza automàticament el disseny assignat tant per a productes simples com per a barreges preparades. Si falta una assignació o un objecte variable, no s'imprimeix una etiqueta genèrica en substitució: apareix un avís i l'envasat continua registrat.
+1. A **Plantilles**, prem **Importar...** i selecciona els fitxers originals. Pots canviar el nom de cada plantilla sense modificar el fitxer original.
+2. Selecciona una plantilla i relaciona els seus noms d'objecte P-touch amb dades del programa: nom del producte, SKU, lot (d'entrada en recepció o d'envasat), caducitat ISO o dia/mes/any, origen i codi de barres. En recepció també hi ha **Proveïdor** i **Data de recepció** (AAAA-MM-DD); en envasat, **Pes** i **Data d'envasat**. El codi de recepció és el codi original del registre, també en reimprimir. **Desar camp** aplica cada relació. Els objectes no relacionats es mantenen fixos, inclosos logotips, textos i imatges. Si un nom no s'ha detectat, es pot introduir manualment; ha de coincidir exactament amb el nom d'objecte definit a P-touch Editor. No és el text visible de l'etiqueta. Cal configurar almenys un camp variable abans d'imprimir per evitar enviar textos de mostra. Si s'assigna un camp que no correspon a l'acció, la impressió s'atura amb un avís.
+3. A **Accions**, selecciona **Recepció de productes**, tria la plantilla i prem **Assignar a l'acció**. La recepció necessita una plantilla: si no n'hi ha cap d'assignada, apareix un avís i no s'imprimeix cap etiqueta genèrica, però la recepció queda registrada.
+4. Les plantilles d'envasat es gestionen a **Productes**: cerca i selecciona un o diversos productes, tria la plantilla i prem **Assignar als seleccionats**; **Cap plantilla** elimina l'assignació. S'aplica tant a productes simples com a barreges preparades. L'associació utilitza el SKU quan n'hi ha; si no, el nom del producte. Si es modifica aquesta identificació al catàleg, cal revisar-ne l'assignació. Activa **Utilitzar plantilles P-touch per als envasats** perquè s'utilitzin. Si falta una assignació o un objecte variable, apareix un avís i l'envasat continua registrat, sense imprimir una etiqueta genèrica en substitució.
 
-**Substituir...** actualitza el disseny mantenint el tipus d'envàs, els camps i les associacions amb productes. Si el nou disseny canvia els noms d'objecte, cal actualitzar-ne les relacions. **Editar a P-touch** obre una còpia de treball amb l'editor associat al sistema; després de desar al mateix fitxer i tancar l'editor, **Recollir canvis** incorpora el disseny actualitzat. La maquetació es fa amb P-touch Editor, no amb un editor de dissenys propi del programa. També es poden exportar els originals o eliminar plantilles que no tinguin productes assignats.
+**Substituir...** actualitza el disseny mantenint el nom, els camps i les associacions amb productes i accions. Si el nou disseny canvia els noms d'objecte, cal actualitzar-ne les relacions. **Editar a P-touch** obre una còpia de treball amb l'editor associat al sistema; després de desar al mateix fitxer i tancar l'editor, **Recollir canvis** incorpora el disseny actualitzat. La maquetació es fa amb P-touch Editor, no amb un editor de dissenys propi del programa. També es poden exportar els originals o eliminar plantilles que no tinguin productes ni accions assignats.
 
 Els dissenys i les associacions es desen dins de la base de dades, sense dependre de la ubicació dels fitxers importats, i s'inclouen a **Desar com** i a desfer/refer. Les còpies de treball de l'editor es desen a `data/template_edits`; no s'eliminen automàticament, per no perdre una edició oberta.
 
-La impressió de plantilles requereix **Windows, una Brother compatible, el controlador oficial i el component Brother b-PAC** de la mateixa arquitectura que l'aplicació (32 o 64 bits). P-touch Editor només és necessari per modificar el disseny. b-PAC s'instal·la per separat des de [Brother](https://support.brother.com/g/s/es/dev/en/bpac/download/index.html); no està inclòs a les dependències Python. La mida i el disseny es defineixen a la plantilla i cal que siguin compatibles amb el rotlle i el controlador. Aquest motor no és una solució per imprimir `.lbx` amb Epson ColorWorks ni des de Linux; es pot desactivar per continuar amb les etiquetes genèriques.
+La impressió de plantilles requereix **Windows, una Brother compatible, el controlador oficial i el component Brother b-PAC** de la mateixa arquitectura que l'aplicació (32 o 64 bits). P-touch Editor només és necessari per modificar el disseny. b-PAC s'instal·la per separat des de [Brother](https://support.brother.com/g/s/es/dev/en/bpac/download/index.html); no està inclòs a les dependències Python. La mida i el disseny es defineixen a la plantilla i cal que siguin compatibles amb el rotlle i el controlador. Aquest motor no és una solució per imprimir `.lbx` amb Epson ColorWorks; es pot desactivar per continuar amb les etiquetes genèriques.
 
 Abans d'enviar una feina es desa un JSON a `output/labels` amb la plantilla completa, els valors i el nombre de còpies. **Impressió > Reimprimir feina de plantilla...** permet tornar-la a enviar, fins i tot després de canviar la plantilla actual, sense crear nous registres d'envasament. Cal comprovar la cua abans de repetir una feina fallida per evitar duplicats si se n'ha imprès una part.
 
@@ -86,7 +83,7 @@ Abans d'enviar una feina es desa un JSON a `output/labels` amb la plantilla comp
 
 El full de recepta es genera en confirmar la impressió de traçabilitat quan es prepara una barreja a Envasat; no en desar només la definició d'una recepta sense ingredients rebuts ni lot de producció.
 
-Si no es pot imprimir una etiqueta, l'avís mostra «No s'ha trobat impressora, etiqueta guardada a» i el directori clicable on s'ha desat. L'enllaç obre l'explorador de fitxers del sistema, tant a Windows com a Linux (mitjançant `xdg-open`). Si falla un document A4, l'avís mostra el motiu i el camí del PDF conservat.
+Si no es pot imprimir una etiqueta, l'avís mostra «No s'ha trobat impressora, etiqueta guardada a» i el directori clicable on s'ha desat. L'enllaç obre la carpeta a l'Explorador de fitxers. Si falla un document A4, l'avís mostra el motiu i el camí del PDF conservat.
 
 El checkbox «No mostrar més avisos d'impressora durant aquesta sessió» silencia aquests avisos fins que s'inicia una nova sessió (en reiniciar el programa o obrir una base de dades). Les etiquetes es continuen generant i desant, i el programa continua intentant imprimir-les.
 
@@ -96,29 +93,9 @@ La icona original és `icon/erola-traçabilitat_ICON.png`. L'aplicació la carre
 
 Per regenerar l'executable de Windows amb la icona, executa `build_exe.bat`. El resultat és `dist/windows/erola producció.exe`.
 
-### Executable per a Linux Mint
+### Executable portable
 
-L'executable Linux s'ha de construir en Linux: PyInstaller no converteix un EXE de Windows en un executable Linux. El mateix fitxer de configuració produeix `dist/linux/erola producció`, sense extensió `.exe`, amb el nom públic i la icona de l'aplicació.
-
-En una versió recent de Linux Mint amb Python 3.11 o superior, instal·la les eines necessàries i executa:
-
-```bash
-sudo apt update
-sudo apt install python3 python3-venv python3-tk python3-pip binutils cups-client
-bash build_linux.sh
-```
-
-El compilador comprova la versió de Python, crea `.venv-linux`, instal·la les dependències i genera el binari. Si el Python que inclou la teva versió de Mint és anterior a 3.11, cal disposar abans d'un Python 3.11 o superior amb els seus paquets Tkinter i venv; el compilador no modifica els repositoris del sistema ni substitueix el Python de Mint.
-
-La compatibilitat del binari Linux depèn de l'arquitectura i de les biblioteques del sistema on es construeix. Construir-lo en el mateix Linux Mint on s'utilitzarà evita assumir una versió concreta de Mint. No es pot donar per verificat fins que la construcció i l'arrencada s'hagin provat en aquell sistema.
-
-Per obrir-lo després de construir-lo:
-
-```bash
-"./dist/linux/erola producció"
-```
-
-Els executables són portables: les carpetes `data` i `output` es creen al costat del binari. Cal posar-lo en una carpeta amb permisos d'escriptura. La construcció no incorpora la base de dades real, les receptes ni les etiquetes de l'usuari; aquestes dades s'han de traslladar separadament si cal conservar-les.
+L'executable és portable: les carpetes `data` i `output` es creen al costat del fitxer `.exe`. Cal posar-lo en una carpeta amb permisos d'escriptura. La construcció no incorpora la base de dades real, les receptes ni les etiquetes de l'usuari; aquestes dades s'han de traslladar separadament si cal conservar-les.
 
 ## Estructura del projecte
 

@@ -16,11 +16,13 @@ from src.db import get_setting, set_setting
 
 SETTINGS_KEY = "packaged_label_templates_v1"
 FIELD_LABELS = {
-    "producte": "Nom del producte", "sku": "SKU", "lot": "Lot d'envasat",
+    "producte": "Nom del producte", "sku": "SKU", "lot": "Lot (entrada o envasat)",
     "caducitat": "Caducitat (AAAA-MM-DD)", "caducitat_dmy": "Caducitat (DD/MM/AAAA)",
     "origen": "Origen", "pes_kg": "Pes (valor en kg)", "pes": "Pes amb unitat kg",
-    "data_envasat": "Data d'envasat", "codi_barres": "Codi de l'envasat",
+    "data_envasat": "Data d'envasat", "codi_barres": "Codi de barres",
+    "proveidor": "Proveïdor (recepció)", "data_recepcio": "Data de recepció",
 }
+ACTION_LABELS = {"recepcio": "Recepció de productes"}
 MAX_TEMPLATE_BYTES = 16 * 1024 * 1024
 
 
@@ -54,12 +56,21 @@ def read_template(data):
 def load_template_config(conn):
     raw = get_setting(conn, SETTINGS_KEY)
     if raw is None:
-        return {"enabled": False, "templates": {}, "products": {}}
+        return {"enabled": False, "templates": {}, "products": {}, "actions": {}}
     try:
         config = json.loads(raw)
         if not isinstance(config["templates"], dict) or not isinstance(config["products"], dict):
             raise ValueError
         if not isinstance(config["enabled"], bool):
+            raise ValueError
+        config.setdefault("actions", {})
+        if isinstance(config["actions"], dict):
+            # Packaging templates are assigned per product; drop the former packaging action.
+            config["actions"].pop("envasat", None)
+        if not isinstance(config["actions"], dict) or any(
+            action not in ACTION_LABELS or not isinstance(identity, str) or identity not in config["templates"]
+            for action, identity in config["actions"].items()
+        ):
             raise ValueError
         return config
     except (ValueError, KeyError, TypeError) as exc:
@@ -90,7 +101,7 @@ def import_label_template(conn, path, template_id=None):
 
 def configure_label_template(conn, template_id, name, fields):
     if not name.strip():
-        raise ValueError("Cal indicar el nom del tipus d'envàs.")
+        raise ValueError("Cal indicar el nom de la plantilla.")
     if any(not key.strip() or value not in FIELD_LABELS for key, value in fields.items()):
         raise ValueError("El nom d'objecte o la dada variable no són vàlids.")
     config = load_template_config(conn)
@@ -123,10 +134,35 @@ def set_templates_enabled(conn, enabled):
     set_setting(conn, SETTINGS_KEY, json.dumps(config, ensure_ascii=False))
 
 
+def assign_action_template(conn, action, template_id):
+    if action not in ACTION_LABELS:
+        raise ValueError("L'acció seleccionada no és vàlida.")
+    config = load_template_config(conn)
+    if template_id is not None and template_id not in config["templates"]:
+        raise ValueError("La plantilla seleccionada ja no existeix.")
+    if template_id is None:
+        config["actions"].pop(action, None)
+    else:
+        config["actions"][action] = template_id
+    set_setting(conn, SETTINGS_KEY, json.dumps(config, ensure_ascii=False))
+
+
+def get_action_template(conn, action):
+    if action not in ACTION_LABELS:
+        raise ValueError("L'acció seleccionada no és vàlida.")
+    config = load_template_config(conn)
+    identity = config["actions"].get(action)
+    if identity not in config["templates"]:
+        raise ValueError(f"L'acció '{ACTION_LABELS[action]}' no té cap plantilla assignada. Revisa Impressió > Plantilles d'etiquetes.")
+    return copy.deepcopy(config["templates"][identity])
+
+
 def delete_label_template(conn, template_id):
     config = load_template_config(conn)
     if template_id in config["products"].values():
         raise ValueError("Hi ha productes associats a aquesta plantilla. Canvia primer la seva assignació.")
+    if template_id in config["actions"].values():
+        raise ValueError("Hi ha accions associades a aquesta plantilla. Canvia primer la seva assignació.")
     del config["templates"][template_id]
     set_setting(conn, SETTINGS_KEY, json.dumps(config, ensure_ascii=False))
 
@@ -137,7 +173,7 @@ def get_product_template(conn, sku, name):
         return None
     identity = config["products"].get(product_template_key(sku, name))
     if identity not in config["templates"]:
-        raise ValueError(f"El producte '{name}' no té cap plantilla assignada. Revisa Impressió > Plantilles d'envasat.")
+        raise ValueError(f"El producte '{name}' no té cap plantilla assignada. Revisa Impressió > Plantilles d'etiquetes.")
     return copy.deepcopy(config["templates"][identity])
 
 
@@ -150,11 +186,12 @@ def template_bytes(template):
 def save_template_job(path, template, values, copies):
     template_bytes(template)
     if not template["fields"]:
-        raise ValueError("La plantilla no té camps variables configurats. Defineix-los a Impressió > Plantilles d'envasat.")
+        raise ValueError("La plantilla no té camps variables configurats. Defineix-los a Impressió > Plantilles d'etiquetes.")
     if not isinstance(copies, int) or isinstance(copies, bool) or copies < 1:
         raise ValueError("El nombre d'etiquetes ha de ser un enter positiu.")
     if any(key not in values for key in template["fields"].values()):
-        raise ValueError("Falten dades per omplir la plantilla.")
+        missing = sorted(set(template["fields"].values()) - values.keys())
+        raise ValueError("Falten dades per omplir la plantilla en aquesta acció: " + ", ".join(FIELD_LABELS.get(key, key) for key in missing))
     with open(path, "w", encoding="utf-8") as target:
         json.dump({"format": "erola.label-job.v1", "template": template, "values": values, "copies": copies},
                   target, ensure_ascii=False, indent=2)
@@ -177,7 +214,7 @@ def print_template_job(path, printer_name):
         if os.name != "nt":
             raise OSError("Les plantilles P-touch amb b-PAC només es poden imprimir a Windows.")
         if not printer_name:
-            raise ValueError("Selecciona una impressora Brother a Impressió > Configurar etiquetes.")
+            raise ValueError("Selecciona una impressora Brother a Impressió > Configurar impressores.")
         with open(path, encoding="utf-8") as source:
             job = json.load(source)
         if job.get("format") != "erola.label-job.v1":

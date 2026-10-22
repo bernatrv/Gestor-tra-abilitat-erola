@@ -55,7 +55,7 @@ def test_packaging_includes_reportlab_dynamic_barcode_modules():
     assert "reportlab" in resource_packages
 
 
-def test_public_build_configuration_for_windows_and_linux():
+def test_public_build_configuration_for_windows():
     import ast
     from pathlib import Path
 
@@ -64,10 +64,9 @@ def test_public_build_configuration_for_windows_and_linux():
     executable = next(node for node in ast.walk(spec) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "EXE")
     name = next(keyword.value for keyword in executable.keywords if keyword.arg == "name")
     assert ast.literal_eval(name) == "erola producció"
-    linux_script = (root / "build_linux.sh").read_bytes()
-    assert linux_script.startswith(b"#!/usr/bin/env bash\n")
-    assert b"\r\n" not in linux_script
-    assert "dist/linux/erola producció" in linux_script.decode("utf-8")
+    assert not (root / "build_linux.sh").exists()
+    release_script = (root / "build_release.ps1").read_text(encoding="utf-8")
+    assert "linux" not in release_script.casefold()
     windows_script = (root / "build_exe.bat").read_text(encoding="utf-8")
     assert "--distpath dist\\windows" in windows_script
 
@@ -677,7 +676,7 @@ def test_label_filenames_are_unique_and_safe(tmp_path, monkeypatch):
         assert Path(path).parent == tmp_path
         assert Path(path).is_file()
         with Image.open(path) as image:
-            assert image.width == 900
+            assert image.size == (732, 354)
 
 
 @pytest.mark.parametrize("provenance", ["", "Catalunya"])
@@ -697,7 +696,7 @@ def test_receipt_and_packaged_labels_have_distinct_fields(tmp_path, monkeypatch,
     name = "Arròs i farina de producció ecològica " * 4
     path = label_print.create_label_image(name, "ENTRY-1", provenance, "2027-12-01", "2026101500101", supplier="Supplier")
     text = [line for line, size in captured]
-    assert "".join(line for line, size in captured if size == 46) == name
+    assert "".join(line for line, size in captured)[:len(name)] == name
     assert "Proveïdor: Supplier" in text
     assert "Lot d'entrada: ENTRY-1" in text
     assert "Caducitat: 2027-12-01" in text
@@ -874,7 +873,7 @@ def test_a4_cancel_is_not_printer_failure(application, tmp_path, status):
 
 
 @pytest.mark.parametrize("size", ["760x500", "980x620"])
-def test_template_manager_opens_without_changing_receipt_printing(application, size):
+def test_template_manager_opens_with_actions_without_changing_settings(application, size):
     from src.label_templates import load_template_config
 
     app, app_module, printer = application
@@ -883,7 +882,9 @@ def test_template_manager_opens_without_changing_receipt_printing(application, s
     dialog.geometry(size)
     dialog.update()
     assert app.grab_current() is dialog
-    assert len(dialog.notebook.tabs()) == 2
+    assert dialog.title() == "Plantilles d'etiquetes"
+    assert [dialog.notebook.tab(tab, "text") for tab in dialog.notebook.tabs()] == ["Plantilles", "Productes", "Accions"]
+    assert dialog.actions_tree.get_children() == ("recepcio",)
     assert not load_template_config(app.conn)["enabled"]
     for tab in dialog.notebook.tabs():
         dialog.notebook.select(tab)
@@ -895,7 +896,8 @@ def test_template_manager_opens_without_changing_receipt_printing(application, s
                     assert widget.winfo_rooty() + widget.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
     dialog.destroy()
     app._print_received_material({"name": "Arros", "supplier_lot": "L-1", "provenance": "", "expiry": "2099-12-01", "barcode": "12345", "supplier": "Supplier"})
-    assert printer.call_args.args[0].endswith(".png")
+    printer.assert_not_called()
+    assert "no té cap plantilla" in app_module.messagebox.showwarning.call_args.args[1]
 
 
 @pytest.mark.parametrize("prepared", [False, True])
@@ -973,6 +975,126 @@ def test_template_manager_import_maps_fields_and_assigns_product(application, mo
     assert not templates.load_template_config(app.conn)["enabled"]
 
 
+def test_template_manager_assigns_actions_and_supports_undo(application, receipt_template):
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    identity, backend = receipt_template
+    dialog = app._show_template_manager()
+    dialog.notebook.select(2)
+    dialog.actions_tree.selection_set("recepcio")
+    dialog._select_action()
+    assert dialog.action_template.get().startswith("Recepció")
+    dialog.action_template.set("Cap plantilla")
+    dialog._assign_action()
+    assert "recepcio" not in templates.load_template_config(app.conn)["actions"]
+    assert dialog.actions_tree.item("recepcio", "values")[1] == "Cap plantilla"
+    dialog.destroy()
+    app.undo_action()
+    assert templates.load_template_config(app.conn)["actions"]["recepcio"] == identity
+    app.redo_action()
+    assert "recepcio" not in templates.load_template_config(app.conn)["actions"]
+
+
+@pytest.mark.parametrize("reprint", [False, True])
+def test_receipts_use_action_template_with_all_receipt_values(application, receipt_template, reprint):
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    identity, backend = receipt_template
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], "test.csv")
+    templates.configure_label_template(app.conn, identity, "Recepció", {
+        field: field for field in ("producte", "sku", "lot", "origen", "caducitat", "caducitat_dmy",
+                                  "codi_barres", "proveidor", "data_recepcio")
+    })
+    if reprint:
+        material = app._register_received_material("Farina", "Supplier", "ENTRY-1", "Catalunya", "2027-12-01")
+        update_raw_material(app.conn, material["id"], "Farina", "Supplier", "ENTRY-1", "Catalunya", "2027-12-01",
+                            created_at="2026-10-14 09:00:00")
+        material = dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material["id"],)).fetchone())
+        app._print_received_material(material)
+    else:
+        app.raw_name.insert(0, "Farina")
+        app.raw_supplier.insert(0, "Supplier")
+        app.raw_supplier_lot.insert(0, "ENTRY-1")
+        app.raw_provenance.insert(0, "Catalunya")
+        app.raw_expiry.insert(0, "01-12-2027")
+        app_module.messagebox.showinfo = Mock()
+        app.save_received_material()
+        material = dict(app.conn.execute("SELECT * FROM raw_materials").fetchone())
+    backend.assert_called_once()
+    printer.assert_not_called()
+    with open(backend.call_args.args[0], encoding="utf-8") as source:
+        job = json.load(source)
+    assert job["copies"] == 1
+    assert job["values"] == {
+        "producte": "Farina", "sku": "001", "lot": "ENTRY-1", "origen": "Catalunya",
+        "caducitat": "2027-12-01", "caducitat_dmy": "01/12/2027", "codi_barres": material["barcode"],
+        "proveidor": "Supplier", "data_recepcio": material["created_at"][:10],
+    }
+    assert job["template"]["name"] == "Recepció"
+    assert not templates.load_template_config(app.conn)["enabled"]
+
+
+@pytest.mark.parametrize("entry_point", ["save", "last_field", "advance"])
+def test_receipt_saves_and_prints_without_confirmation(application, receipt_template, monkeypatch, entry_point):
+    from types import SimpleNamespace
+
+    app, app_module, printer = application
+    _, backend = receipt_template
+    monkeypatch.setattr(app_module.messagebox, "askyesno", Mock())
+    monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], "test.csv")
+    app.raw_name.insert(0, "Farina")
+    app.raw_supplier_lot.insert(0, "ENTRY-1")
+    app.raw_expiry.insert(0, "01-12-2027")
+    if entry_point == "save":
+        app.save_received_material()
+    elif entry_point == "last_field":
+        assert app._handle_last_received_field(SimpleNamespace(widget=app.raw_expiry)) == "break"
+    else:
+        assert app._advance_received_field(SimpleNamespace(widget=app.raw_expiry)) == "break"
+    assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
+    backend.assert_called_once()
+    printer.assert_not_called()
+    app_module.messagebox.askyesno.assert_not_called()
+    app_module.messagebox.showinfo.assert_not_called()
+    app_module.messagebox.showwarning.assert_not_called()
+    app_module.messagebox.showerror.assert_not_called()
+    assert app.raw_name.get() == ""
+
+
+def test_missing_receipt_template_keeps_receipt_without_generic_printing(application, monkeypatch):
+    app, app_module, printer = application
+    monkeypatch.setattr(app_module.messagebox, "askyesno", Mock())
+    monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], "test.csv")
+    app.raw_name.insert(0, "Farina")
+    app.raw_supplier_lot.insert(0, "ENTRY-1")
+    app.raw_expiry.insert(0, "01-12-2027")
+    app._handle_last_received_field(None)
+    assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
+    printer.assert_not_called()
+    assert "no té cap plantilla" in app_module.messagebox.showwarning.call_args.args[1]
+    app_module.messagebox.askyesno.assert_not_called()
+    app_module.messagebox.showinfo.assert_not_called()
+
+
+def test_receipt_template_with_packaging_only_field_reports_error(application, receipt_template):
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    identity, backend = receipt_template
+    templates.configure_label_template(app.conn, identity, "Incorrecta", {"Data": "data_envasat"})
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], "test.csv")
+    material = app._register_received_material("Farina", "Supplier", "ENTRY-1", "", "2027-12-01")
+    result = app._print_received_material(material)
+    assert result["status"] == "error"
+    assert "Data d'envasat" in app_module.messagebox.showwarning.call_args.args[1]
+    backend.assert_not_called()
+    printer.assert_not_called()
+
+
 def test_missing_template_does_not_print_generic_or_lose_packaging(application):
     from src import label_templates as templates
 
@@ -992,26 +1114,48 @@ def test_label_print_menu_persists_printer_and_dimensions(application, monkeypat
 
     app, app_module, printer = application
     monkeypatch.setattr(printing, "SETTINGS_PATH", tmp_path / "printing.json")
-    monkeypatch.setattr(app_module, "list_printers", Mock(return_value=["Brother QL-600", "ColorWorks"]))
+    monkeypatch.setattr(app_module, "list_printer_choices", Mock(return_value=[
+        ("Brother QL-600 (USB001)", "Brother QL-600 (Copiar 1)"),
+        ("Microsoft Print to PDF (PORTPROMPT:)", "Microsoft Print to PDF"),
+    ]))
+    monkeypatch.setattr(app_module, "get_default_printer", Mock(return_value="Brother QL-600 (Copiar 1)"))
     preferences = Mock()
     monkeypatch.setattr(app_module, "printer_preferences", preferences)
-    app._show_label_print_settings()
+    app._show_printer_settings()
     dialog = app.grab_current()
-    combo = next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Combobox))
-    combo.set("ColorWorks")
-    next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Button)).invoke()
-    preferences.assert_called_once_with("ColorWorks", dialog.winfo_id())
-    next(child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Checkbutton)).invoke()
-    inputs = [child for child in dialog.winfo_children() if isinstance(child, app_module.ttk.Spinbox)]
+    combos = [child for frame in dialog.winfo_children() if isinstance(frame, app_module.ttk.LabelFrame)
+              for child in frame.winfo_children() if isinstance(child, app_module.ttk.Combobox)]
+    assert len(combos) == 2
+    assert combos[1].get() == "Selecciona una impressora..."
+    combos[0].set("Brother QL-600 (USB001)")
+    combos[1].set("Microsoft Print to PDF (PORTPROMPT:)")
+    preference_buttons = [child for frame in dialog.winfo_children() if isinstance(frame, app_module.ttk.LabelFrame)
+                          for child in frame.winfo_children() if isinstance(child, app_module.ttk.Button)]
+    preference_buttons[0].invoke()
+    preference_buttons[1].invoke()
+    assert preferences.call_args_list[0].args == ("Brother QL-600 (Copiar 1)", dialog.winfo_id())
+    assert preferences.call_args_list[1].args == ("Microsoft Print to PDF", dialog.winfo_id())
+    inputs = [child for frame in dialog.winfo_children() if isinstance(frame, app_module.ttk.LabelFrame)
+              for child in frame.winfo_children() if isinstance(child, app_module.ttk.Spinbox)]
     for entry, value in zip(inputs, ("80", "50")):
         entry.delete(0, "end")
         entry.insert(0, value)
     buttons = next(child for child in dialog.winfo_children() if isinstance(child, app_module.tk.Frame))
     next(child for child in buttons.winfo_children() if child.cget("text") == "Desar").invoke()
-    assert app.printer_name == "ColorWorks"
-    assert printing.load_label_settings() == {"printer": "ColorWorks", "custom_size": True, "width_mm": 80, "height_mm": 50}
+    assert app.printer_name == "Brother QL-600 (Copiar 1)"
+    assert app.document_printer == "Microsoft Print to PDF"
+    assert printing.load_label_settings() == {
+        "label_printer": "Brother QL-600 (Copiar 1)", "document_printer": "Microsoft Print to PDF",
+        "label_roll_width_mm": 80, "label_roll_length_mm": 50,
+    }
+    printer.reset_mock()
+    app._print_saved_labels([str(tmp_path / "sessio.pdf")])
+    printer.assert_called_once_with(
+        str(tmp_path / "sessio.pdf"), None, document_printer="Microsoft Print to PDF",
+    )
     app._open_database(str(tmp_path / "other.db"))
-    assert app.printer_name == "ColorWorks"
+    assert app.printer_name == "Brother QL-600 (Copiar 1)"
+    assert app.document_printer == "Microsoft Print to PDF"
 
 
 @pytest.mark.parametrize("count", [10, 60])
@@ -1086,6 +1230,23 @@ def application(tmp_path, monkeypatch):
     finally:
         app.conn.close()
         app.destroy()
+
+
+@pytest.fixture
+def receipt_template(application, tmp_path, monkeypatch):
+    import zipfile
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    path = tmp_path / "Recepcio.lbx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/><objectStyle objectName="Codi"/></label>')
+    identity = templates.import_label_template(app.conn, path)
+    templates.configure_label_template(app.conn, identity, "Recepció", {"Producte": "producte", "Codi": "codi_barres"})
+    templates.assign_action_template(app.conn, "recepcio", identity)
+    backend = Mock(return_value={"status": "printed", "message": "OK"})
+    monkeypatch.setattr(app_module, "print_template_job", backend)
+    return identity, backend
 
 
 @pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
@@ -1348,11 +1509,12 @@ def test_numeric_enter_matches_return(application):
     assert app._recipe_ing_active_cell == (row, "Nom")
 
 
-def test_receipt_reprint_and_editor(application, monkeypatch):
+def test_receipt_reprint_and_editor(application, monkeypatch, receipt_template):
     import tkinter as tk
     from types import SimpleNamespace
 
     app, app_module, printer = application
+    _, backend = receipt_template
     material_id = add_raw_material(app.conn, "Farina", "Supplier", "ORIGIN-1", "Origen", "2027-12-01", "RAW-1")
     app.refresh_materials()
     app.update()
@@ -1362,8 +1524,10 @@ def test_receipt_reprint_and_editor(application, monkeypatch):
     assert button.winfo_ismapped()
     before = dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone())
     button.invoke()
-    assert printer.call_count == 1
-    assert Image.open(printer.call_args.args[0]).width > 0
+    assert backend.call_count == 1
+    with open(backend.call_args.args[0], encoding="utf-8") as source:
+        assert json.load(source)["values"]["codi_barres"] == "RAW-1"
+    printer.assert_not_called()
     bounds = app.received_tree.bbox(str(material_id), "Nom")
     app._on_received_double_click(SimpleNamespace(y=bounds[1] + bounds[3] // 2))
     dialog = app.grab_current()
@@ -1374,7 +1538,7 @@ def test_receipt_reprint_and_editor(application, monkeypatch):
     buttons = {child.cget("text"): child for frame in dialog.winfo_children() if isinstance(frame, tk.Frame)
                for child in frame.winfo_children()}
     buttons["Imprimir"].invoke()
-    assert printer.call_count == 2
+    assert backend.call_count == 2
     assert dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone()) == before
     expiry = dialog.nametowidget("expiry")
     expiry.delete(0, "end")
@@ -1397,10 +1561,11 @@ def test_receipt_reprint_and_editor(application, monkeypatch):
     assert dialog.winfo_exists()
     received_at.delete(0, "end")
     received_at.insert(0, "14-10-2026")
-    label_factory = Mock(wraps=app_module.create_label_image)
-    monkeypatch.setattr(app_module, "create_label_image", label_factory)
+    label_factory = Mock(wraps=app_module.create_template_label_job)
+    monkeypatch.setattr(app_module, "create_template_label_job", label_factory)
     buttons["Imprimir"].invoke()
-    assert label_factory.call_args.args[4] == "RAW-EDITED"
+    assert label_factory.call_args.args[1]["codi_barres"] == "RAW-EDITED"
+    assert label_factory.call_args.args[1]["data_recepcio"] == "2026-10-14"
     assert dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone()) == before
     buttons["Guardar"].invoke()
     after = dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone())
@@ -1422,9 +1587,9 @@ def test_receipt_reprint_and_editor(application, monkeypatch):
                     child.invoke()
                     break
     assert dict(app.conn.execute("SELECT * FROM raw_materials WHERE id = ?", (material_id,)).fetchone()) == after
-    printer.side_effect = RuntimeError("Printer unavailable")
+    backend.side_effect = RuntimeError("Printer unavailable")
     app._received_print_buttons[str(material_id)].invoke()
-    assert app._show_label_saved_notice.called
+    assert app_module.messagebox.showwarning.call_args.args[0] == "Plantilla no impresa"
     assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
 
 
@@ -1486,12 +1651,14 @@ def test_recipe_transfer_buttons_and_confirmation(application, monkeypatch, tmp_
 
 
 @pytest.mark.parametrize("status", ["error", "skipped"])
-def test_receipt_print_reports_returned_failure(application, status):
+def test_receipt_print_reports_returned_failure(application, receipt_template, status):
     app, app_module, printer = application
-    printer.return_value = {"status": status, "message": "Printer unavailable"}
+    _, backend = receipt_template
+    backend.return_value = {"status": status, "message": "Printer unavailable"}
     app._print_received_material({"name": "Farina", "supplier": "Supplier", "supplier_lot": "LOT-1",
-                                  "provenance": "", "expiry": "2027-12-01", "barcode": "RAW-1"})
-    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
+                                  "provenance": "", "expiry": "2027-12-01", "barcode": "RAW-1", "created_at": "2026-10-14 09:00:00"})
+    app_module.messagebox.showwarning.assert_called_once_with("Plantilla no impresa", "Printer unavailable", parent=app)
+    printer.assert_not_called()
 
 
 @pytest.mark.parametrize("size", ["1200x760", "1000x650"])
@@ -1917,23 +2084,27 @@ def test_all_packaged_labels_are_saved_before_printer_failure(application, monke
     assert app.conn.execute("SELECT quantity FROM packaged_products").fetchone()[0] == 3
 
 
-def test_new_receipt_reports_saved_file_without_printer(application, monkeypatch):
+def test_new_receipt_reports_saved_file_without_printer(application, receipt_template, monkeypatch):
     from pathlib import Path
     from src.db import upsert_catalog_rows
 
     app, app_module, printer = application
     upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], source_file="test")
-    printer.side_effect = lambda path, name: label_print.print_label_file(path, None)
+    _, backend = receipt_template
+    backend.side_effect = lambda path, name: {"status": "error", "message": f"Printer unavailable\nFeina conservada a: {path}"}
+    monkeypatch.setattr(app_module.messagebox, "askyesno", Mock())
     monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
     app.raw_name.insert(0, "Farina")
     app.raw_supplier.insert(0, "Supplier")
     app.raw_supplier_lot.insert(0, "ENTRY-1")
     app.raw_expiry.insert(0, "01-12-2027")
-    app.save_received_material()
-    assert printer.call_count == 1
-    assert Path(printer.call_args.args[0]).is_file()
-    app._show_label_saved_notice.assert_called_once_with(printer.call_args.args[0], parent=None)
+    app._handle_last_received_field(None)
+    backend.assert_called_once()
+    printer.assert_not_called()
+    assert Path(backend.call_args.args[0]).is_file()
+    assert str(backend.call_args.args[0]) in app_module.messagebox.showwarning.call_args.args[1]
     app_module.messagebox.showinfo.assert_not_called()
+    app_module.messagebox.askyesno.assert_not_called()
     assert app.conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()[0] == 1
 
 

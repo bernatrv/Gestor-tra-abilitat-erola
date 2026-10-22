@@ -4,24 +4,32 @@ Cada versió publicada té una carpeta pròpia. No s'han de sobreescriure les ve
 
 ```text
 versions/
-  0.1.0-alpha.1/
-    windows/erola-produccio-0.1.0-alpha.1-windows.exe
-    linux/erola-produccio-0.1.0-alpha.1-linux-fonts.zip
+  0.1.0-alpha.4/
+    windows/erola-produccio-0.1.0-alpha.4-windows.exe
     SHA256SUMS.txt
     release.json
 ```
 
-L'executable de Windows és portable. El ZIP de Linux conté una còpia de les fonts, les proves i el constructor `build_linux.sh`; cal extreure'l i construir-lo en Linux seguint el README inclòs. No és un executable Linux precompilat ni implica compatibilitat nativa verificada.
+El programa és només per a Windows. L'executable és portable. Les versions fins a la 0.1.0-alpha.3 també incloïen un ZIP de fonts per a Linux, que es conserva a la seva carpeta però ja no es genera.
 
-No s'hi inclouen bases de dades, receptes de l'usuari, etiquetes ni exportacions de sessions. Les dades s'han de conservar separadament. `SHA256SUMS.txt` permet comprovar la integritat dels dos fitxers i `release.json` identifica la versió i la data de construcció.
+No s'hi inclouen bases de dades, receptes de l'usuari, etiquetes ni exportacions de sessions. Les dades s'han de conservar separadament. `SHA256SUMS.txt` permet comprovar la integritat de l'executable i `release.json` identifica la versió i la data de construcció.
 
 ## Crear una nova versió
 
-1. Actualitza `VERSION`, per exemple a `0.1.0-alpha.2`.
+1. Actualitza `VERSION`, per exemple a `0.1.0-alpha.5`.
 2. Afegeix les novetats en aquest historial.
-3. Executa `./build_release.ps1` des de PowerShell a Windows, amb les dependències i PyInstaller instal·lats a `.venv`.
+3. Executa `./build_release.ps1` des de PowerShell, amb les dependències i PyInstaller instal·lats a `.venv`.
 
-El script executa les proves abans de construir els paquets i es nega a sobreescriure una carpeta de versió existent. `./build_release.ps1 -ValidateOnly` comprova els requisits i els noms sense construir res.
+El script executa les proves abans de construir l'executable i es nega a sobreescriure una carpeta de versió existent. `./build_release.ps1 -ValidateOnly` comprova els requisits i els noms sense construir res.
+
+## 0.1.0-alpha.4 - 2026-10-22
+
+- Programa només per a Windows: es retiren el constructor i la documentació de Linux, i les versions només generen l'executable de Windows.
+- «Plantilles d'envasat» passa a dir-se «Plantilles d'etiquetes» i incorpora la pestanya Accions.
+- Les etiquetes de recepció utilitzen una plantilla P-touch assignada a l'acció «Recepció de productes», amb proveïdor, data de recepció i codi de barres original, també en reimprimir. Si falta la plantilla, s'avisa i la recepció queda registrada sense imprimir cap etiqueta genèrica.
+- Les plantilles d'envasat continuen assignant-se per producte a la pestanya Productes.
+- La recepció s'imprimeix automàticament, sense preguntar si es vol imprimir ni mostrar la confirmació de registre. Es mantenen els avisos si falta impressora o plantilla, o si falla la impressió.
+- Missatge que indica quins camps de la plantilla no corresponen a l'acció.
 
 ## 0.1.0-alpha.3 - 2026-10-19
 

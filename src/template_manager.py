@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from src.db import list_catalog_products
 from src.label_templates import (
-    FIELD_LABELS, assign_product_template, configure_label_template, delete_label_template,
+    ACTION_LABELS, FIELD_LABELS, assign_action_template, assign_product_template, configure_label_template, delete_label_template,
     import_label_template, load_template_config, product_template_key, set_templates_enabled, template_bytes,
 )
 
@@ -22,7 +22,7 @@ class TemplateManager(tk.Toplevel):
         self.config_data = load_template_config(app.conn)
         super().__init__(app)
         self.app = app
-        self.title("Plantilles d'envasat")
+        self.title("Plantilles d'etiquetes")
         self.transient(app)
         self.geometry(f"{min(980, app.winfo_screenwidth() - 60)}x{min(620, app.winfo_screenheight() - 100)}")
         self.minsize(700, 420)
@@ -37,10 +37,13 @@ class TemplateManager(tk.Toplevel):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         template_panel = ttk.Frame(self.notebook, padding=8)
         product_panel = ttk.Frame(self.notebook, padding=8)
+        action_panel = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(template_panel, text="Plantilles")
         self.notebook.add(product_panel, text="Productes")
+        self.notebook.add(action_panel, text="Accions")
         self._build_templates(template_panel)
         self._build_products(product_panel)
+        self._build_actions(action_panel)
         self._refresh_templates()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda event: self.destroy())
@@ -54,7 +57,7 @@ class TemplateManager(tk.Toplevel):
             with self.app._action(description):
                 return True, operation()
         except Exception as exc:
-            messagebox.showerror("Plantilles d'envasat", str(exc), parent=self)
+            messagebox.showerror("Plantilles d'etiquetes", str(exc), parent=self)
             return False, None
 
     def _set_enabled(self):
@@ -77,7 +80,7 @@ class TemplateManager(tk.Toplevel):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
         self.templates_tree = ttk.Treeview(left, columns=("name", "file"), show="headings", selectmode="browse")
-        self.templates_tree.heading("name", text="Tipus d'envàs")
+        self.templates_tree.heading("name", text="Plantilla")
         self.templates_tree.heading("file", text="Fitxer")
         self.templates_tree.column("name", width=160)
         self.templates_tree.column("file", width=180)
@@ -88,7 +91,7 @@ class TemplateManager(tk.Toplevel):
         details.grid(row=1, column=1, sticky="nsew")
         details.columnconfigure(1, weight=1)
         details.rowconfigure(2, weight=1)
-        ttk.Label(details, text="Tipus d'envàs").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(details, text="Nom de plantilla").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
         self.name = tk.StringVar(self)
         ttk.Entry(details, textvariable=self.name).grid(row=0, column=1, sticky="ew", pady=6)
         ttk.Button(details, text="Desar nom", command=self._save_details).grid(row=0, column=2, padx=(6, 0))
@@ -137,11 +140,64 @@ class TemplateManager(tk.Toplevel):
         controls = ttk.Frame(panel)
         controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text="Tipus d'envàs").grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(controls, text="Plantilla d'envasat").grid(row=0, column=0, padx=(0, 8))
         self.product_template = tk.StringVar(self, value="Cap plantilla")
         self.product_combo = ttk.Combobox(controls, textvariable=self.product_template, state="readonly")
         self.product_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         ttk.Button(controls, text="Assignar als seleccionats", command=self._assign).grid(row=0, column=2)
+
+    def _build_actions(self, panel):
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+        ttk.Label(panel, text="Les plantilles d'envasat s'assignen a cada producte des de la pestanya Productes.",
+                  wraplength=620).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        table = ttk.Frame(panel)
+        table.grid(row=1, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        self.actions_tree = ttk.Treeview(table, columns=("action", "template"), show="headings", selectmode="browse")
+        self.actions_tree.heading("action", text="Acció")
+        self.actions_tree.heading("template", text="Plantilla")
+        self.actions_tree.column("action", width=260)
+        self.actions_tree.column("template", width=300)
+        self.actions_tree.grid(row=0, column=0, sticky="nsew")
+        self.app._attach_scrollbars(self.actions_tree, horizontal=True)
+        self.actions_tree.bind("<<TreeviewSelect>>", self._select_action)
+        controls = ttk.Frame(panel)
+        controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(controls, text="Plantilla").grid(row=0, column=0, padx=(0, 8))
+        self.action_template = tk.StringVar(self, value="Cap plantilla")
+        self.action_combo = ttk.Combobox(controls, textvariable=self.action_template, state="readonly")
+        self.action_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(controls, text="Assignar a l'acció", command=self._assign_action).grid(row=0, column=2)
+
+    def _refresh_actions(self):
+        selected = self.actions_tree.selection()
+        self.actions_tree.delete(*self.actions_tree.get_children())
+        for action, label in ACTION_LABELS.items():
+            identity = self.config_data["actions"].get(action)
+            template = self.config_data["templates"].get(identity, {})
+            self.actions_tree.insert("", "end", iid=action, values=(label, template.get("name", "Cap plantilla")))
+        if selected:
+            self.actions_tree.selection_set(selected)
+            self._select_action()
+
+    def _select_action(self, event=None):
+        selected = self.actions_tree.selection()
+        if selected:
+            identity = self.config_data["actions"].get(selected[0])
+            self.action_template.set(next(label for label, key in self._template_choices.items() if key == identity))
+
+    def _assign_action(self):
+        selected = self.actions_tree.selection()
+        if not selected:
+            messagebox.showwarning("Acció no seleccionada", "Selecciona l'acció que vols configurar.", parent=self)
+            return
+        identity = self._template_choices[self.action_template.get()]
+        success, _ = self._run("Plantilles: assignar acció", lambda: assign_action_template(self.app.conn, selected[0], identity))
+        if success:
+            self._refresh_templates()
 
     def _refresh_templates(self, identity=None):
         self.config_data = load_template_config(self.app.conn)
@@ -150,6 +206,9 @@ class TemplateManager(tk.Toplevel):
         for key, template in self.config_data["templates"].items():
             self.templates_tree.insert("", "end", iid=key, values=(template["name"], template["filename"]))
             self._template_choices[f"{template['name']} [{key[:6]}]"] = key
+        self.action_combo.configure(values=list(self._template_choices))
+        if self.action_template.get() not in self._template_choices:
+            self.action_template.set("Cap plantilla")
         self.product_combo.configure(values=list(self._template_choices))
         if self.product_template.get() not in self._template_choices:
             self.product_template.set("Cap plantilla")
@@ -164,6 +223,7 @@ class TemplateManager(tk.Toplevel):
             self._fields = {}
             self.fields_tree.delete(*self.fields_tree.get_children())
         self._refresh_products()
+        self._refresh_actions()
 
     def _select_template(self, event=None):
         selected = self.templates_tree.selection()
@@ -210,7 +270,7 @@ class TemplateManager(tk.Toplevel):
         return success
 
     def _import(self):
-        paths = filedialog.askopenfilenames(parent=self, title="Importar plantilles d'envasat", filetypes=[("P-touch", "*.lbx")])
+        paths = filedialog.askopenfilenames(parent=self, title="Importar plantilles d'etiquetes", filetypes=[("P-touch", "*.lbx")])
         for path in paths:
             success, identity = self._run("Plantilla: importar", lambda path=path: import_label_template(self.app.conn, path))
             if success:

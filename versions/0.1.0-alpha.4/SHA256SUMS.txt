@@ -1,0 +1,1 @@
+aee840eec5e608dfe4a91cfe53e1a38c0b1bf97c4d385c9e1170c12b14ee8148  windows/erola-produccio-0.1.0-alpha.4-windows.exe

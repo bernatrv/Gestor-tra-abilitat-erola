@@ -82,9 +82,9 @@ from src.db import (
     upsert_recipe,
     validate_recipes_data,
 )
-from src.label_print import create_label_image, create_mixture_label_image, create_packaged_label_image, create_packaged_template_job, create_session_document, print_label_file
-from src.label_templates import get_product_template, print_template_job
-from src.printing import list_printers, load_label_settings, printer_preferences, save_label_settings
+from src.label_print import create_mixture_label_image, create_packaged_label_image, create_template_label_job, create_session_document, print_label_file
+from src.label_templates import get_action_template, get_product_template, print_template_job
+from src.printing import get_default_printer, list_printer_choices, load_label_settings, printer_preferences, save_label_settings
 
 _CATALOG_COLUMNS = ("SKU", "Nom", "Pes", "Categoria")
 _CATALOG_EDITABLE_COLUMNS = ("SKU", "Nom", "Pes")
@@ -155,7 +155,9 @@ class TraceabilityApp(tk.Tk):
         available_height = max(1, self.winfo_screenheight() - 100)
         self.geometry(f"{min(1200, available_width)}x{min(760, available_height)}")
         self.minsize(min(1000, available_width), min(500, available_height))
-        self.printer_name = load_label_settings()["printer"]
+        printer_settings = load_label_settings()
+        self.printer_name = printer_settings["label_printer"]
+        self.document_printer = printer_settings["document_printer"]
         self.suppress_printer_alerts = tk.BooleanVar(self, value=False)
         self.package_ingredients: list[dict] = []
         self.package_final_product: dict | None = None
@@ -216,8 +218,8 @@ class TraceabilityApp(tk.Tk):
         edit_menu.add_command(label="Historial", command=self.show_history_window)
         menubar.add_cascade(label="Edita", menu=edit_menu)
         printing_menu = tk.Menu(menubar, tearoff=0)
-        printing_menu.add_command(label="Configurar etiquetes...", command=self._show_label_print_settings)
-        printing_menu.add_command(label="Plantilles d'envasat...", command=self._show_template_manager)
+        printing_menu.add_command(label="Configurar impressores...", command=self._show_printer_settings)
+        printing_menu.add_command(label="Plantilles d'etiquetes...", command=self._show_template_manager)
         printing_menu.add_command(label="Reimprimir feina de plantilla...", command=self._reprint_template_job)
         menubar.add_cascade(label="Impressió", menu=printing_menu)
         self.bind_all("<Control-z>", self._on_undo_shortcut)
@@ -238,63 +240,107 @@ class TraceabilityApp(tk.Tk):
         try:
             return TemplateManager(self)
         except Exception as exc:
-            messagebox.showerror("Plantilles d'envasat", str(exc), parent=self)
+            messagebox.showerror("Plantilles d'etiquetes", str(exc), parent=self)
 
     def _show_label_print_settings(self):
+        return self._show_printer_settings()
+
+    def _show_printer_settings(self):
         settings = load_label_settings()
         dialog = tk.Toplevel(self)
-        dialog.title("Impressió d'etiquetes")
+        dialog.title("Configuració d'impressores")
         dialog.transient(self)
         dialog.resizable(False, False)
-        selected = tk.StringVar(dialog, value=self.printer_name)
-        custom_size = tk.BooleanVar(dialog, value=settings["custom_size"])
-        width = tk.StringVar(dialog, value=f"{settings['width_mm']:g}")
-        height = tk.StringVar(dialog, value=f"{settings['height_mm']:g}")
-        tk.Label(dialog, text="Impressora").grid(row=0, column=0, sticky="w", padx=12, pady=8)
+        dialog.geometry("680x400")
         try:
-            printers = list_printers()
+            choices = list_printer_choices()
         except Exception as exc:
-            printers = []
+            choices = []
             messagebox.showerror("Impressores no disponibles", str(exc), parent=dialog)
-        combo = ttk.Combobox(dialog, textvariable=selected, values=printers, width=42, state="readonly")
-        combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=12, pady=8)
+        display_to_name = dict(choices)
+        name_to_display = {name: label for label, name in choices}
+        label_name = settings["label_printer"]
+        if label_name not in name_to_display and choices:
+            label_name = choices[0][1]
+        document_name = settings["document_printer"] or get_default_printer()
+        if document_name not in name_to_display or document_name == label_name:
+            document_name = ""
+        selected_label = tk.StringVar(dialog, value=name_to_display.get(label_name, ""))
+        selected_document = tk.StringVar(dialog, value=(name_to_display.get(document_name, "")
+                                                        if document_name else "Selecciona una impressora..."))
+        width = tk.StringVar(dialog, value=f"{settings['label_roll_width_mm']:g}")
+        length = tk.StringVar(dialog, value=f"{settings['label_roll_length_mm']:g}")
 
-        def preferences():
+        label_frame = ttk.LabelFrame(dialog, text="Impressora d'etiquetes", padding=10)
+        label_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        label_frame.columnconfigure(1, weight=1)
+        ttk.Label(label_frame, text="Impressora").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        label_combo = ttk.Combobox(label_frame, textvariable=selected_label,
+                                   values=[label for label, _ in choices], width=48, state="readonly")
+        label_combo.grid(row=0, column=1, sticky="ew", pady=5)
+        ttk.Label(label_frame, text="Amplada del rotlle (mm)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Spinbox(label_frame, textvariable=width, from_=1, to=1000, increment=0.1, width=12).grid(
+            row=1, column=1, sticky="w", pady=5,
+        )
+        ttk.Label(label_frame, text="Llargada de l'etiqueta (mm)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Spinbox(label_frame, textvariable=length, from_=1, to=1000, increment=0.1, width=12).grid(
+            row=2, column=1, sticky="w", pady=5,
+        )
+
+        def label_preferences():
             try:
-                printer_preferences(selected.get(), dialog.winfo_id())
+                printer_preferences(display_to_name[selected_label.get()], dialog.winfo_id())
             except Exception as exc:
-                messagebox.showerror("Preferències de la impressora", str(exc), parent=dialog)
+                messagebox.showerror("Preferències de la impressora d'etiquetes", str(exc), parent=dialog)
 
-        ttk.Button(dialog, text="Preferències del controlador...", command=preferences).grid(row=1, column=1, columnspan=2, sticky="w", padx=12, pady=8)
-        size_inputs = []
+        ttk.Button(label_frame, text="Preferències del controlador...", command=label_preferences).grid(
+            row=3, column=1, sticky="w", pady=(8, 2),
+        )
 
-        def update_size_state():
-            for entry in size_inputs:
-                entry.configure(state="normal" if custom_size.get() else "disabled")
+        document_frame = ttk.LabelFrame(dialog, text="Impressora normal (A4)", padding=10)
+        document_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        document_frame.columnconfigure(1, weight=1)
+        ttk.Label(document_frame, text="Impressora").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        document_combo = ttk.Combobox(document_frame, textvariable=selected_document,
+                                      values=["Selecciona una impressora...", *[label for label, _ in choices]],
+                                      width=48, state="readonly")
+        document_combo.grid(row=0, column=1, sticky="ew", pady=5)
 
-        ttk.Checkbutton(dialog, text="Mida personalitzada", variable=custom_size,
-                        command=update_size_state).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=8)
-        for row, text, variable in ((3, "Amplada (mm)", width), (4, "Alçada (mm)", height)):
-            tk.Label(dialog, text=text).grid(row=row, column=0, sticky="w", padx=12, pady=8)
-            entry = ttk.Spinbox(dialog, textvariable=variable, from_=1, to=1000, increment=1, width=12)
-            entry.grid(row=row, column=1, sticky="w", padx=12, pady=8)
-            size_inputs.append(entry)
-        update_size_state()
+        def document_preferences():
+            try:
+                if selected_document.get() not in display_to_name:
+                    raise ValueError("Selecciona primer la impressora normal.")
+                printer_preferences(display_to_name[selected_document.get()], dialog.winfo_id())
+            except Exception as exc:
+                messagebox.showerror("Preferències de la impressora normal", str(exc), parent=dialog)
+
+        ttk.Button(document_frame, text="Preferències del controlador...", command=document_preferences).grid(
+            row=1, column=1, sticky="w", pady=(8, 2),
+        )
+        ttk.Label(dialog, text="La mida del rotlle s'indica manualment. Tall, qualitat i opcions del paper es configuren al controlador.",
+                  wraplength=640).grid(row=2, column=0, sticky="w", padx=16, pady=(4, 8))
 
         def save():
             try:
-                if selected.get() not in printers:
-                    raise ValueError("Selecciona una impressora instal·lada.")
-                save_label_settings({"printer": selected.get(), "custom_size": custom_size.get(),
-                                     "width_mm": width.get().replace(",", "."), "height_mm": height.get().replace(",", ".")})
+                if selected_label.get() not in display_to_name:
+                    raise ValueError("Selecciona una impressora d'etiquetes instal·lada.")
+                if selected_document.get() not in display_to_name or not display_to_name[selected_document.get()]:
+                    raise ValueError("Selecciona una impressora normal instal·lada.")
+                save_label_settings({
+                    "label_printer": display_to_name[selected_label.get()],
+                    "document_printer": display_to_name[selected_document.get()],
+                    "label_roll_width_mm": width.get().replace(",", "."),
+                    "label_roll_length_mm": length.get().replace(",", "."),
+                })
             except (ValueError, OSError) as exc:
                 messagebox.showerror("Configuració no guardada", str(exc), parent=dialog)
                 return
-            self.printer_name = selected.get()
+            self.printer_name = display_to_name[selected_label.get()]
+            self.document_printer = display_to_name[selected_document.get()]
             dialog.destroy()
 
         buttons = tk.Frame(dialog)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        buttons.grid(row=3, column=0, sticky="e", padx=12, pady=10)
         ttk.Button(buttons, text="Desar", command=save).pack(side="left", padx=4)
         ttk.Button(buttons, text="Cancel·lar", command=dialog.destroy).pack(side="left", padx=4)
         dialog.bind("<Escape>", lambda event: dialog.destroy())
@@ -302,7 +348,7 @@ class TraceabilityApp(tk.Tk):
         dialog.wait_visibility()
         dialog.update_idletasks()
         dialog.grab_set()
-        combo.focus_set()
+        label_combo.focus_set()
 
     def _open_database(self, path: str):
         new_conn = initialize_db(path)
@@ -745,14 +791,20 @@ class TraceabilityApp(tk.Tk):
 
     def _print_received_material(self, material, parent=None):
         try:
-            path = create_label_image(
-                material["name"], material["supplier_lot"], material["provenance"],
-                material["expiry"], material["barcode"], supplier=material["supplier"],
-            )
+            template = get_action_template(self.conn, "recepcio")
+            expiry = parse_date(material["expiry"])
+            values = {
+                "producte": material["name"], "sku": get_catalog_sku_by_name(self.conn, material["name"]) or "",
+                "lot": material["supplier_lot"], "origen": material["provenance"] or "",
+                "caducitat": material["expiry"], "caducitat_dmy": expiry.strftime("%d/%m/%Y") if expiry else "",
+                "codi_barres": material["barcode"], "proveidor": material["supplier"] or "",
+                "data_recepcio": material["created_at"][:10],
+            }
+            path = create_template_label_job(template, values, 1)
         except Exception as exc:
             messagebox.showwarning("Etiqueta no generada", str(exc), parent=parent or self)
-            return
-        self._print_saved_labels([path], parent=parent)
+            return {"status": "error", "message": str(exc)}
+        return self._print_saved_labels([path], parent=parent)
 
     def _print_saved_labels(self, paths, parent=None):
         failure = None
@@ -762,7 +814,11 @@ class TraceabilityApp(tk.Tk):
                 if Path(path).suffix.lower() == ".json":
                     result = print_template_job(path, self.printer_name)
                 else:
-                    result = print_label_file(path, None if Path(path).suffix.lower() == ".pdf" else self.printer_name)
+                    result = print_label_file(
+                        path,
+                        None if Path(path).suffix.lower() == ".pdf" else self.printer_name,
+                        document_printer=self.document_printer,
+                    )
             except Exception as exc:
                 result = {"status": "error", "message": f"No s'ha pogut imprimir: {exc}\nFitxer desat a: {path}"}
             if result.get("status") not in ("printed", "cancelled", "opened"):
@@ -933,8 +989,7 @@ class TraceabilityApp(tk.Tk):
 
     def _handle_last_received_field(self, event):
         self._hide_suggestions()
-        answer = messagebox.askyesno("Imprimir etiqueta", "Vols imprimir el codi de barres d'aquest producte?")
-        self.save_received_material(should_print=answer)
+        self.save_received_material()
         return "break"
 
     def _on_raw_name_keyrelease(self, event):
@@ -2105,7 +2160,7 @@ class TraceabilityApp(tk.Tk):
                     "pes": f"{weight:g} kg" if weight is not None else "",
                     "data_envasat": date.today().isoformat(), "codi_barres": lot,
                 }
-                paths = [create_packaged_template_job(template, values, copies)]
+                paths = [create_template_label_job(template, values, copies)]
             return self._print_saved_labels(paths)
         except Exception as exc:
             messagebox.showwarning("Etiquetes no generades", str(exc), parent=self)
@@ -4062,24 +4117,13 @@ class TraceabilityApp(tk.Tk):
             messagebox.showerror("Recepció no guardada", str(exc))
             return
 
-        barcode = material["barcode"]
-        expiry = material["expiry"]
         self._clear_received_form()
         self.refresh_materials()
 
         if not should_print:
             return
 
-        try:
-            label_path = create_label_image(name, supplier_lot, provenance, expiry, barcode, supplier=supplier)
-            result = self._print_saved_labels([label_path])
-            if result["status"] != "printed":
-                return
-        except Exception as exc:
-            messagebox.showwarning("Etiqueta no generada", str(exc))
-            return
-
-        messagebox.showinfo("Dada registrada", f"Producte registrat: {name} ({supplier_lot})")
+        self._print_received_material(material)
 
     def _clear_received_form(self):
         self.raw_name.delete(0, tk.END)
