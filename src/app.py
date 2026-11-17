@@ -23,6 +23,8 @@ from src.core import (
     generate_daily_sequential_lot,
     generate_packed_lot,
     ingredient_matches_recipe_ingredients,
+    CSV_EXTRA_FIELDS,
+    CSV_EXTRA_FIELD_LABELS,
     parse_csv_mapping,
     parse_date,
     rank_recipes_by_match,
@@ -56,7 +58,9 @@ from src.db import (
     rename_reference_value,
     replace_reference_values,
     list_catalog_products,
+    list_catalog_product_candidates,
     list_edited_catalog_products,
+    list_packaging_ingredient_candidates,
     list_packaged_products,
     list_prepared_mixtures,
     list_raw_materials,
@@ -70,6 +74,7 @@ from src.db import (
     revert_all_catalog_edits,
     revert_catalog_row,
     replace_catalog_rows,
+    rank_packaging_ingredient_candidates,
     search_catalog_products,
     search_distinct_raw_material_values,
     search_history_suggestions,
@@ -170,6 +175,10 @@ class TraceabilityApp(tk.Tk):
         self.suggestions_items: list = []
         self.suggestions_apply = None
         self.suggestions_anchor_entry: tk.Entry | None = None
+        self._progressive_suggestion_jobs = {}
+        self._progressive_suggestion_generations = {"package_ingredient": 0, "package_product": 0}
+        self._progressive_suggestion_states = {}
+        self._progressive_suggestion_cache = {}
         self._package_history_rows: dict = {}
         self._prepared_mixture_rows: dict = {}
         self._package_final_product_catalog_row = None
@@ -590,6 +599,9 @@ class TraceabilityApp(tk.Tk):
         if not selected:
             return
         tab_text = event.widget.tab(selected, "text")
+        if tab_text != "Envasat":
+            for kind in self._progressive_suggestion_generations:
+                self._cancel_progressive_suggestion_search(kind)
         # Cada pestanya té el seu propi camp "principal": en canviar de pestanya (amb F1..FN o
         # clicant la pestanya) cal moure-hi el focus explícitament, altrament el teclat segueix
         # enviant tecles al quadre de la pestanya anterior (que ja no és visible).
@@ -793,13 +805,21 @@ class TraceabilityApp(tk.Tk):
         try:
             template = get_action_template(self.conn, "recepcio")
             expiry = parse_date(material["expiry"])
+            catalog_product = get_catalog_row_by_name(self.conn, material["name"])
+            template_fields = set(template["fields"].values())
             values = {
-                "producte": material["name"], "sku": get_catalog_sku_by_name(self.conn, material["name"]) or "",
+                "producte": material["name"],
+                "sku": catalog_product["sku"] if catalog_product else get_catalog_sku_by_name(self.conn, material["name"]) or "",
                 "lot": material["supplier_lot"], "origen": material["provenance"] or "",
                 "caducitat": material["expiry"], "caducitat_dmy": expiry.strftime("%d/%m/%Y") if expiry else "",
                 "codi_barres": material["barcode"], "proveidor": material["supplier"] or "",
                 "data_recepcio": material["created_at"][:10],
             }
+            values.update({
+                field: (catalog_product[field] or "") if catalog_product else ""
+                for field in CSV_EXTRA_FIELDS
+                if field in template_fields
+            })
             path = create_template_label_job(template, values, 1)
         except Exception as exc:
             messagebox.showwarning("Etiqueta no generada", str(exc), parent=parent or self)
@@ -1057,7 +1077,18 @@ class TraceabilityApp(tk.Tk):
 
         self._show_suggestions(self.raw_provenance, matches, matches, apply_provenance_suggestion)
 
-    def _show_suggestions(self, anchor_entry, items, labels, apply_callback):
+    def _show_suggestions(self, anchor_entry, items, labels, apply_callback, preserve_selection=False):
+        selected_item = None
+        if (
+            preserve_selection
+            and self.suggestions_anchor_entry is anchor_entry
+            and self.suggestions_listbox is not None
+            and self.suggestions_listbox.curselection()
+        ):
+            selected_index = self.suggestions_listbox.curselection()[0]
+            if selected_index < len(self.suggestions_items):
+                selected_item = self.suggestions_items[selected_index]
+
         self.suggestions_items = items
         self.suggestions_apply = apply_callback
         self.suggestions_anchor_entry = anchor_entry
@@ -1085,6 +1116,12 @@ class TraceabilityApp(tk.Tk):
         self.suggestions_listbox.configure(height=visible_rows)
         for label in labels:
             self.suggestions_listbox.insert(tk.END, label)
+        if selected_item is not None:
+            for index, item in enumerate(items):
+                if self._suggestion_item_key(item) == self._suggestion_item_key(selected_item):
+                    self.suggestions_listbox.selection_set(index)
+                    self.suggestions_listbox.activate(index)
+                    break
 
         listbox_font = tkfont.Font(font=self.suggestions_listbox.cget("font"))
         max_label_width = max((listbox_font.measure(label) for label in labels), default=0)
@@ -1094,6 +1131,177 @@ class TraceabilityApp(tk.Tk):
         width = max(anchor_entry.winfo_width(), max_label_width + 30, 260)
         self.suggestions_window.geometry(f"{width}x{visible_rows * 20}+{x}+{y}")
         self.suggestions_window.deiconify()
+
+    @staticmethod
+    def _suggestion_item_key(item):
+        if hasattr(item, "keys"):
+            keys = item.keys()
+            return (
+                item["barcode"] if "barcode" in keys else None,
+                item["mixture_id"] if "mixture_id" in keys else None,
+                item["name"] if "name" in keys else None,
+                item["sku"] if "sku" in keys else None,
+            )
+        return item
+
+    @staticmethod
+    def _progressive_search_key(value):
+        return " ".join("".join(
+            character
+            for character in unicodedata.normalize("NFD", str(value or "").casefold())
+            if not unicodedata.combining(character)
+        ).split())
+
+    def _cancel_progressive_suggestion_search(self, kind):
+        self._progressive_suggestion_generations[kind] += 1
+        job = self._progressive_suggestion_jobs.pop(kind, None)
+        if job is not None:
+            self.after_cancel(job)
+        self._progressive_suggestion_states.pop(kind, None)
+
+    def _cancel_all_progressive_suggestion_searches(self):
+        for kind in self._progressive_suggestion_generations:
+            self._cancel_progressive_suggestion_search(kind)
+
+    def _progressive_suggestion_rows(self, kind, loader):
+        connection = self.conn
+        version = connection.total_changes
+        cached = self._progressive_suggestion_cache.get(kind)
+        if cached is None or cached["connection"] is not connection or cached["version"] != version:
+            rows = loader(connection)
+            cached = {
+                "connection": connection,
+                "version": version,
+                "rows": rows,
+                "keys": [
+                    (self._progressive_search_key(row["name"]), self._progressive_search_key(row["sku"]))
+                    for row in rows
+                ],
+            }
+            self._progressive_suggestion_cache[kind] = cached
+        return cached["rows"]
+
+    def _rank_progressive_exact_suggestions(self, kind, rows, term):
+        query = self._progressive_search_key(term)
+        if not query:
+            return []
+        cached_keys = self._progressive_suggestion_cache[kind]["keys"]
+        ranked = []
+        for index, (name, sku) in enumerate(cached_keys):
+            best = 3
+            for value in (name, sku):
+                if value == query:
+                    best = 0
+                    break
+                if value.startswith(query):
+                    best = min(best, 1)
+                elif query in value:
+                    best = min(best, 2)
+            if best < 3:
+                ranked.append(((best, 0.0), index, rows[index]))
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        return [row for score, index, row in ranked]
+
+    @staticmethod
+    def _fuzzy_suggestion_score(query, value):
+        normalized = TraceabilityApp._progressive_search_key(value)
+        if not normalized:
+            return 0.0
+        words = normalized.split()
+        window = len(query.split())
+        candidates = [normalized] + [
+            " ".join(words[start:start + window])
+            for start in range(len(words))
+        ]
+        return max(SequenceMatcher(None, query, candidate).ratio() for candidate in candidates)
+
+    def _start_progressive_suggestions(self, kind, anchor, text, rows, labeler, apply_callback):
+        for other_kind in self._progressive_suggestion_generations:
+            if other_kind != kind:
+                self._cancel_progressive_suggestion_search(other_kind)
+        self._cancel_progressive_suggestion_search(kind)
+        generation = self._progressive_suggestion_generations[kind]
+        query = self._progressive_search_key(text)
+        exact = self._rank_progressive_exact_suggestions(kind, rows, text)
+        exact_visible = exact[:8]
+        exact_keys = {self._suggestion_item_key(row) for row in exact}
+
+        if exact_visible:
+            self._show_suggestions(
+                anchor,
+                exact_visible,
+                [labeler(row) for row in exact_visible],
+                apply_callback,
+            )
+        else:
+            self._hide_suggestions()
+
+        if len(exact_visible) >= 8 or len(query) < 4 or query.isdecimal():
+            return
+
+        self._progressive_suggestion_states[kind] = {
+            "generation": generation,
+            "anchor": anchor,
+            "text": text,
+            "query": query,
+            "rows": rows,
+            "labeler": labeler,
+            "apply_callback": apply_callback,
+            "exact": exact_visible,
+            "exact_keys": exact_keys,
+            "approximate": [],
+            "cursor": 0,
+        }
+        self._progressive_suggestion_jobs[kind] = self.after(
+            140, lambda: self._run_progressive_suggestion_batch(kind, generation)
+        )
+
+    def _run_progressive_suggestion_batch(self, kind, generation):
+        state = self._progressive_suggestion_states.get(kind)
+        if state is None or state["generation"] != generation:
+            return
+        self._progressive_suggestion_jobs.pop(kind, None)
+        if state["anchor"].get().strip() != state["text"]:
+            self._cancel_progressive_suggestion_search(kind)
+            return
+
+        rows = state["rows"]
+        start = state["cursor"]
+        end = min(start + 24, len(rows))
+        query = state["query"]
+        approximate = state["approximate"]
+        for index in range(start, end):
+            row = rows[index]
+            if self._suggestion_item_key(row) in state["exact_keys"]:
+                continue
+            name = " ".join(self._text_sort_key(row["name"]).split())
+            sku = " ".join(self._text_sort_key(row["sku"]).split())
+            if not name or query in name or query in sku:
+                continue
+            score = self._fuzzy_suggestion_score(query, name)
+            if score >= 0.78:
+                approximate.append((-score, index, row))
+
+        state["cursor"] = end
+        if end > start and state["exact"]:
+            state["exact"] = state["exact"][:8]
+        approximate.sort(key=lambda item: (item[0], item[1]))
+        available = max(0, 8 - len(state["exact"]))
+        state["approximate"] = approximate[:available]
+        matches = state["exact"] + [row for score, index, row in state["approximate"]]
+        if matches:
+            self._show_suggestions(
+                state["anchor"],
+                matches,
+                [state["labeler"](row) for row in matches],
+                state["apply_callback"],
+                preserve_selection=True,
+            )
+
+        if end < len(rows):
+            self._progressive_suggestion_jobs[kind] = self.after(
+                10, lambda: self._run_progressive_suggestion_batch(kind, generation)
+            )
 
     def _hide_suggestions(self):
         if self.suggestions_window is not None:
@@ -1133,7 +1341,7 @@ class TraceabilityApp(tk.Tk):
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
         self.package_vertical_panes = ThinPanedWindow(frame, orient=tk.VERTICAL)
-        self.package_vertical_panes.grid(row=0, column=0, sticky="nsew", padx=10, pady=12)
+        self.package_vertical_panes.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         top = tk.Frame(self.package_vertical_panes)
         top.grid_columnconfigure(0, weight=1)
         top.grid_rowconfigure(0, weight=1)
@@ -1151,15 +1359,7 @@ class TraceabilityApp(tk.Tk):
         self._build_package_form(self.package_form_container)
 
         self.package_status = tk.StringVar(value="")
-        status_label = tk.Label(form_panel, textvariable=self.package_status, wraplength=320, justify="left")
-        self.package_status_label = status_label
-        status_label.grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=4
-        )
-        status_label.bind("<Configure>", lambda event: status_label.config(wraplength=max(1, event.width)))
         self._package_minimum_height_job = None
-        self.package_status.trace_add("write", self._update_package_status_visibility)
-        self._update_package_status_visibility()
         form_panel.bind("<Configure>", self._schedule_package_minimum_height)
 
         self.package_recipe_panel_container = tk.Frame(self.package_top_panes)
@@ -1170,8 +1370,8 @@ class TraceabilityApp(tk.Tk):
         self.package_vertical_panes.add(history_frame, minsize=110, stretch="always")
         history_frame.grid_columnconfigure(0, weight=1)
         history_frame.grid_rowconfigure(1, weight=1)
-        tk.Label(history_frame, text="Historial d'envasats (doble clic per recarregar un producte)", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w"
+        tk.Label(history_frame, text="Historial d'envasats (doble clic per recarregar un producte)", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 1)
         )
         self.package_history_tree = ttk.Treeview(
             history_frame,
@@ -1186,13 +1386,6 @@ class TraceabilityApp(tk.Tk):
         self._attach_scrollbars(self.package_history_tree, horizontal=True)
         self.package_history_tree.bind("<Double-1>", self._on_package_history_select)
         self._setup_sortable_tree(self.package_history_tree, numeric_columns=("Quantitat", "Pes (kg)"))
-        self._schedule_package_minimum_height()
-
-    def _update_package_status_visibility(self, *_args):
-        if self.package_status.get().strip():
-            self.package_status_label.grid()
-        else:
-            self.package_status_label.grid_remove()
         self._schedule_package_minimum_height()
 
     def _schedule_package_minimum_height(self, event=None):
@@ -1210,42 +1403,33 @@ class TraceabilityApp(tk.Tk):
 
     def _build_package_form(self, frame):
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(4, weight=1)
-        tk.Label(frame, text="Ingredient (codi de barres / nom / SKU)", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(4, 4)
+        frame.grid_rowconfigure(3, weight=1)
+        tk.Label(frame, text="Ingredient (codi de barres / nom / SKU)", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(1, 1)
         )
         self.package_ingredient_entry = tk.Entry(frame)
-        self.package_ingredient_entry.grid(row=1, column=0, pady=(0, 4), sticky="ew")
+        self.package_ingredient_entry.grid(row=1, column=0, pady=(0, 2), sticky="ew")
         self.package_ingredient_entry.bind("<KeyRelease>", self._on_package_ingredient_keyrelease)
         self.package_ingredient_entry.bind("<Down>", lambda event: self._on_suggestions_down_from(self.package_ingredient_entry))
         self.package_ingredient_entry.bind("<Return>", self._on_package_ingredient_enter)
         self.package_ingredient_entry.bind("<Tab>", self._on_package_ingredient_tab)
         self.package_ingredient_entry.bind("<Shift-Tab>", lambda event: self._hide_suggestions())
 
-        ingredient_help = tk.Label(
-            frame,
-            text="Intro afegeix l'ingredient i en permet un altre. Tab acaba i passa a Quantitat.",
-            font=("Segoe UI", 8),
-            fg="#555555",
-            wraplength=320,
-            justify="left",
+        tk.Label(frame, text="Ingredients afegits", font=("Segoe UI", 9, "bold")).grid(
+            row=2, column=0, sticky="w", pady=(1, 1)
         )
-        ingredient_help.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        ingredient_help.bind("<Configure>", lambda event: ingredient_help.config(wraplength=max(1, event.width)))
-
-        tk.Label(frame, text="Ingredients afegits", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w", pady=(4, 4))
         self.ingredients_list = tk.Listbox(frame, height=3)
-        self.ingredients_list.grid(row=4, column=0, pady=(0, 4), sticky="nsew")
-        frame.grid_rowconfigure(4, minsize=self.ingredients_list.winfo_reqheight() + 4)
+        self.ingredients_list.grid(row=3, column=0, pady=(0, 2), sticky="nsew")
+        frame.grid_rowconfigure(3, minsize=self.ingredients_list.winfo_reqheight() + 2)
         self._attach_scrollbars(self.ingredients_list)
         self.ingredients_list.bind("<Delete>", self._on_ingredients_list_delete)
 
         self.package_final_product_label = tk.Label(
-            frame, text="Producte final (nom / SKU / codi)", font=("Segoe UI", 10, "bold")
+            frame, text="Producte final (nom / SKU / codi)", font=("Segoe UI", 9, "bold")
         )
-        self.package_final_product_label.grid(row=5, column=0, sticky="w", pady=4)
+        self.package_final_product_label.grid(row=4, column=0, sticky="w", pady=(2, 1))
         final_product_row = tk.Frame(frame)
-        final_product_row.grid(row=6, column=0, pady=(0, 4), sticky="ew")
+        final_product_row.grid(row=5, column=0, pady=(0, 2), sticky="ew")
         final_product_row.grid_columnconfigure(0, weight=1)
         self.package_final_product_entry = tk.Entry(final_product_row)
         self.package_final_product_entry.grid(row=0, column=0, sticky="ew")
@@ -1266,18 +1450,20 @@ class TraceabilityApp(tk.Tk):
         self.package_final_product_weight_label.grid(row=0, column=1, padx=(8, 0))
         self.package_final_product_weight_label.bind("<Double-1>", self._on_package_final_product_weight_double_click)
 
-        tk.Label(frame, text="Quantitat", font=("Segoe UI", 10, "bold")).grid(row=7, column=0, sticky="w", pady=4)
         quantity_row = tk.Frame(frame)
-        quantity_row.grid(row=8, column=0, pady=(0, 4), sticky="ew")
+        quantity_row.grid(row=6, column=0, pady=(2, 2), sticky="ew")
         quantity_row.grid_columnconfigure(1, weight=1)
+        self.package_quantity_label = tk.Label(quantity_row, text="Quantitat", font=("Segoe UI", 9, "bold"))
+        self.package_quantity_label.grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.package_quantity_entry = tk.Entry(quantity_row, width=15)
-        self.package_quantity_entry.grid(row=0, column=0, sticky="w")
+        self.package_quantity_entry.grid(row=0, column=1, sticky="ew")
         self.package_quantity_entry.bind("<Return>", self._finalize_packaging)
         self.package_quantity_entry.bind("<Shift-Tab>", self._on_package_back_to_final_product)
-        tk.Button(
+        self.package_clear_button = tk.Button(
             quantity_row, text="✕", command=self._on_clear_package_form_clicked, width=3,
             fg="white", bg="#c0392b",
-        ).grid(row=0, column=2, sticky="e")
+        )
+        self.package_clear_button.grid(row=0, column=2, sticky="e", padx=(4, 0))
 
     def _build_package_recipe_panel(self, frame):
         frame.grid_columnconfigure(0, weight=1)
@@ -1292,11 +1478,11 @@ class TraceabilityApp(tk.Tk):
         lookup_frame.grid_rowconfigure(2, weight=1)
         ingredients_frame.grid_rowconfigure(0, weight=1)
 
-        tk.Label(lookup_frame, text="Cercador de receptes", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(4, 4)
+        tk.Label(lookup_frame, text="Cercador de receptes", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(1, 1)
         )
         self.package_recipe_search_entry = tk.Entry(lookup_frame)
-        self.package_recipe_search_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.package_recipe_search_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 2))
         self.package_recipe_search_entry.bind("<KeyRelease>", self._on_package_recipe_search_changed)
         self.package_recipe_search_entry.bind("<Down>", self._select_first_package_recipe)
         self.package_recipe_search_entry.bind("<Tab>", self._select_first_package_recipe)
@@ -1442,32 +1628,49 @@ class TraceabilityApp(tk.Tk):
             return
         text = self.package_ingredient_entry.get().strip()
         if not text:
+            self._cancel_all_progressive_suggestion_searches()
             self._hide_suggestions()
             return
-        matches = search_packaging_ingredients(self.conn, text)
-        if not matches:
-            self._hide_suggestions()
-            return
+        rows = self._progressive_suggestion_rows(
+            "package_ingredient", list_packaging_ingredient_candidates
+        )
 
-        labels = []
-        for row in matches:
+        def label(row):
             sku_part = row["sku"] if row["sku"] else "sense SKU"
             entry_date = (row["created_at"] or "").split(" ")[0]
             source = "Barreja preparada" if row["mixture_id"] else "Entrada"
-            labels.append(
+            return (
                 f"{row['name']}  [{sku_part}]  {source}:{entry_date}  Lot:{row['supplier_lot']}  Caduca:{row['expiry']}"
             )
 
         def apply_ingredient_suggestion(chosen):
+            self._cancel_progressive_suggestion_search("package_ingredient")
             self._add_package_ingredient(chosen)
 
-        self._show_suggestions(self.package_ingredient_entry, matches, labels, apply_ingredient_suggestion)
+        self._start_progressive_suggestions(
+            "package_ingredient",
+            self.package_ingredient_entry,
+            text,
+            rows,
+            label,
+            apply_ingredient_suggestion,
+        )
 
     def _resolve_package_ingredient(self, text):
         """Resol un ingredient a partir d'un codi de barres/lot exacte o d'un nom/SKU sense ambigüitat."""
         material = get_packaging_ingredient_by_barcode(self.conn, text)
         if material is not None:
             return material, None
+        rows = self._progressive_suggestion_rows(
+            "package_ingredient", list_packaging_ingredient_candidates
+        )
+        exact_matches = rank_packaging_ingredient_candidates(
+            rows, text, limit=2, include_fuzzy=False
+        )
+        if len(exact_matches) == 1:
+            return exact_matches[0], None
+        if len(exact_matches) > 1:
+            return None, "Hi ha diversos lots que coincideixen amb aquest nom o SKU. Selecciona'n un de la llista."
         matches = search_packaging_ingredients(self.conn, text)
         if len(matches) == 1:
             return matches[0], None
@@ -1476,12 +1679,13 @@ class TraceabilityApp(tk.Tk):
         return None, "Aquest codi, nom o SKU no existeix al registre de productes rebuts."
 
     def _on_package_ingredient_enter(self, event):
+        self._cancel_progressive_suggestion_search("package_ingredient")
         text = self.package_ingredient_entry.get().strip()
         if not text:
             return "break"
         material, error = self._resolve_package_ingredient(text)
         if material is None:
-            if search_packaging_ingredients(self.conn, text):
+            if error != "Aquest codi, nom o SKU no existeix al registre de productes rebuts.":
                 messagebox.showwarning("Ingredient no trobat", error)
             else:
                 self._open_package_quick_receipt(text)
@@ -1660,6 +1864,7 @@ class TraceabilityApp(tk.Tk):
         entries["supplier" if fields["name"].get() else "name"].focus_set()
 
     def _add_package_ingredient(self, material):
+        self._cancel_progressive_suggestion_search("package_ingredient")
         with self._action(f"Envasat: afegir ingredient {material['name']}"):
             self._add_package_ingredient_impl(material)
 
@@ -1720,6 +1925,7 @@ class TraceabilityApp(tk.Tk):
         return "break"
 
     def _on_package_ingredient_tab(self, event):
+        self._cancel_progressive_suggestion_search("package_ingredient")
         self._hide_suggestions()
         if not self.package_ingredients:
             messagebox.showwarning("Sense ingredients", "Cal identificar almenys un ingredient abans de continuar.")
@@ -1782,19 +1988,28 @@ class TraceabilityApp(tk.Tk):
             return
         text = self.package_final_product_entry.get().strip()
         if not text:
+            self._cancel_all_progressive_suggestion_searches()
             self._hide_suggestions()
             return
-        matches = search_catalog_products(self.conn, text)
-        if not matches:
-            self._hide_suggestions()
-            return
+        rows = self._progressive_suggestion_rows(
+            "package_product", list_catalog_product_candidates
+        )
 
-        labels = [f"{row['name']}   [{row['sku']}]" if row["sku"] else row["name"] for row in matches]
+        def label(row):
+            return f"{row['name']}   [{row['sku']}]" if row["sku"] else row["name"]
 
         def apply_final_product_suggestion(chosen):
+            self._cancel_progressive_suggestion_search("package_product")
             self._set_package_final_product({"name": chosen["name"], "sku": chosen["sku"]})
 
-        self._show_suggestions(self.package_final_product_entry, matches, labels, apply_final_product_suggestion)
+        self._start_progressive_suggestions(
+            "package_product",
+            self.package_final_product_entry,
+            text,
+            rows,
+            label,
+            apply_final_product_suggestion,
+        )
 
     def _confirm_catalog_product(self, text, parent=None):
         row = get_catalog_row_by_sku(self.conn, text) or get_catalog_row_by_name(self.conn, text)
@@ -2153,6 +2368,10 @@ class TraceabilityApp(tk.Tk):
                 paths = [create_packaged_label_image(name, lot, provenance, expiry, weight=weight) for index in range(copies)]
             else:
                 expiry_date = parse_date(expiry)
+                catalog_product = get_catalog_row_by_sku(self.conn, sku) if sku else None
+                if catalog_product is None:
+                    catalog_product = get_catalog_row_by_name(self.conn, name)
+                template_fields = set(template["fields"].values())
                 values = {
                     "producte": name, "sku": sku or "", "lot": lot, "origen": provenance or "",
                     "caducitat": expiry, "caducitat_dmy": expiry_date.strftime("%d/%m/%Y") if expiry_date else "",
@@ -2160,6 +2379,11 @@ class TraceabilityApp(tk.Tk):
                     "pes": f"{weight:g} kg" if weight is not None else "",
                     "data_envasat": date.today().isoformat(), "codi_barres": lot,
                 }
+                values.update({
+                    field: (catalog_product[field] or "") if catalog_product else ""
+                    for field in CSV_EXTRA_FIELDS
+                    if field in template_fields
+                })
                 paths = [create_template_label_job(template, values, copies)]
             return self._print_saved_labels(paths)
         except Exception as exc:
@@ -2557,62 +2781,110 @@ class TraceabilityApp(tk.Tk):
         dialog.transient(self)
         dialog.grab_set()
         dialog.grid_columnconfigure(1, weight=1)
+        dialog.grid_columnconfigure(3, weight=1)
 
-        def guess(keywords):
-            for header in headers:
-                low = header.lower()
-                if any(keyword in low for keyword in keywords):
-                    return header
-            return headers[0]
+        def normalized(text):
+            return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+
+        def guess(keywords, optional=False, exclude_keywords=()):
+            ordered_keywords = sorted((normalized(keyword) for keyword in keywords), key=len, reverse=True)
+            excluded = tuple(normalized(keyword) for keyword in exclude_keywords)
+            for exact in (True, False):
+                for keyword in ordered_keywords:
+                    for header in headers:
+                        low = normalized(header)
+                        if any(exclusion in low for exclusion in excluded):
+                            continue
+                        matches = low == keyword if exact else keyword in low
+                        if matches:
+                            return header
+            return "" if optional else headers[0]
 
         sku_var = tk.StringVar(value=guess(("sku", "codi", "referencia", "ref")))
-        name_var = tk.StringVar(value=guess(("nom", "name", "descripcio", "producte")))
+        name_var = tk.StringVar(value=guess(
+            ("nom producte", "nom del producte", "producte", "name", "nom"),
+            exclude_keywords=("cientific", "scientific"),
+        ))
         weight_var = tk.StringVar(value=guess(("pes", "weight", "kg")))
         category_var = tk.StringVar(value=guess(("categoria", "category", "familia", "grup")))
-
-        tk.Label(dialog, text="Columna SKU", font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(12, 4)
+        required_fields = (
+            ("Columna SKU", sku_var),
+            ("Columna NOM", name_var),
+            ("Columna PÈS", weight_var),
+            ("Columna CATEGORIA", category_var),
         )
-        sku_combo = ttk.Combobox(dialog, state="readonly", values=headers, textvariable=sku_var)
-        sku_combo.grid(row=0, column=1, sticky="ew", padx=10, pady=(12, 4))
+        required_combos = []
+        for index, (label, variable) in enumerate(required_fields):
+            row, pair = divmod(index, 2)
+            label_column = pair * 2
+            tk.Label(dialog, text=label, font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=label_column, sticky="w", padx=10, pady=(12, 4) if row == 0 else 4
+            )
+            combo = ttk.Combobox(dialog, state="readonly", values=headers, textvariable=variable)
+            combo.grid(row=row, column=label_column + 1, sticky="ew", padx=10, pady=(12, 4) if row == 0 else 4)
+            required_combos.append(combo)
 
-        tk.Label(dialog, text="Columna NOM", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", padx=10, pady=4)
-        name_combo = ttk.Combobox(dialog, state="readonly", values=headers, textvariable=name_var)
-        name_combo.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
-
-        tk.Label(dialog, text="Columna PÈS", font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", padx=10, pady=4)
-        weight_combo = ttk.Combobox(dialog, state="readonly", values=headers, textvariable=weight_var)
-        weight_combo.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
-
-        tk.Label(dialog, text="Columna CATEGORIA", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w", padx=10, pady=4)
-        category_combo = ttk.Combobox(dialog, state="readonly", values=headers, textvariable=category_var)
-        category_combo.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
+        extra_keywords = {
+            "traduccions": ("traduccions", "translations"),
+            "nom_cientific": ("nom cientific", "scientific name"),
+            "descripcio": ("descripcio", "description"),
+            "preparacio": ("preparacio", "preparation"),
+            "contraindicacions": ("contraindicacions", "contraindications"),
+            "ingredients_catala": ("ingredients catala", "ingredients català"),
+            "ingredients_castella": ("ingredients castella", "ingredients castellà"),
+        }
+        extra_vars = {
+            field: tk.StringVar(value=guess(extra_keywords[field], optional=True))
+            for field in CSV_EXTRA_FIELDS
+        }
+        for index, (field, label) in enumerate(CSV_EXTRA_FIELD_LABELS.items()):
+            row, pair = divmod(index, 2)
+            row += 2
+            label_column = pair * 2
+            tk.Label(dialog, text=f"{label} (opcional)", font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=label_column, sticky="w", padx=10, pady=4
+            )
+            combo = ttk.Combobox(
+                dialog,
+                state="readonly",
+                values=("", *headers),
+                textvariable=extra_vars[field],
+            )
+            combo.grid(row=row, column=label_column + 1, sticky="ew", padx=10, pady=4)
 
         tk.Label(dialog, text="Vista prèvia (fila 2 del CSV)", font=("Segoe UI", 9, "bold")).grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(14, 4)
+            row=6, column=0, columnspan=4, sticky="w", padx=10, pady=(14, 4)
         )
         preview_var = tk.StringVar()
-        tk.Label(dialog, textvariable=preview_var, justify="left", wraplength=420).grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10)
+        tk.Label(dialog, textvariable=preview_var, justify="left", wraplength=820).grid(
+            row=7, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 10)
         )
 
         first_row = rows[0]
 
         def update_preview(*_args):
-            sku = first_row.get(sku_var.get(), "")
-            name = first_row.get(name_var.get(), "")
-            weight = first_row.get(weight_var.get(), "")
-            category = first_row.get(category_var.get(), "")
-            preview_var.set(f"SKU: {sku}\nNom: {name}\nPès: {weight}\nCategoria: {category}")
+            def preview_value(value):
+                text = str(value)
+                return text if len(text) <= 120 else text[:117] + "..."
 
-        sku_combo.bind("<<ComboboxSelected>>", update_preview)
-        name_combo.bind("<<ComboboxSelected>>", update_preview)
-        weight_combo.bind("<<ComboboxSelected>>", update_preview)
-        category_combo.bind("<<ComboboxSelected>>", update_preview)
+            mapped_values = [
+                ("SKU", first_row.get(sku_var.get(), "")),
+                ("Nom", first_row.get(name_var.get(), "")),
+                ("Pes", first_row.get(weight_var.get(), "")),
+                ("Categoria", first_row.get(category_var.get(), "")),
+            ]
+            mapped_values.extend(
+                (label, first_row.get(extra_vars[field].get(), "") if extra_vars[field].get() else "(no importat)")
+                for field, label in CSV_EXTRA_FIELD_LABELS.items()
+            )
+            preview_var.set("\n".join(f"{label}: {preview_value(value)}" for label, value in mapped_values))
+
+        for variable in (sku_var, name_var, weight_var, category_var, *extra_vars.values()):
+            variable.trace_add("write", update_preview)
         update_preview()
 
         button_row = tk.Frame(dialog)
-        button_row.grid(row=6, column=0, columnspan=2, pady=16)
+        button_row.grid(row=8, column=0, columnspan=4, pady=16)
 
         def accept():
             sku_field, name_field, weight_field = sku_var.get(), name_var.get(), weight_var.get()
@@ -2622,12 +2894,26 @@ class TraceabilityApp(tk.Tk):
                     "Mapejat incomplet", "Selecciona les quatre columnes abans d'acceptar.", parent=dialog
                 )
                 return
-            if len({sku_field, name_field, weight_field, category_field}) < 4:
+            selected_columns = [
+                sku_field,
+                name_field,
+                weight_field,
+                category_field,
+                *(variable.get() for variable in extra_vars.values() if variable.get()),
+            ]
+            if len(set(selected_columns)) < len(selected_columns):
                 messagebox.showwarning(
-                    "Columnes repetides", "Les quatre columnes han de ser diferents.", parent=dialog
+                    "Columnes repetides", "Cada camp ha de tenir una columna diferent.", parent=dialog
                 )
                 return
-            normalized = parse_csv_mapping(rows, sku_field, name_field, weight_field, category_field)
+            normalized = parse_csv_mapping(
+                rows,
+                sku_field,
+                name_field,
+                weight_field,
+                category_field,
+                {field: variable.get() for field, variable in extra_vars.items()},
+            )
             if not normalized:
                 messagebox.showwarning(
                     "CSV sense dades",
@@ -2647,7 +2933,7 @@ class TraceabilityApp(tk.Tk):
         )
         tk.Button(button_row, text="Cancel·lar", command=dialog.destroy, width=14).pack(side="left", padx=6)
 
-        sku_combo.focus_set()
+        required_combos[0].focus_set()
 
     def refresh_product_catalog_table(self):
         for item in self.product_tree.get_children():

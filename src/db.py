@@ -9,7 +9,7 @@ import unicodedata
 from datetime import date, datetime
 from difflib import SequenceMatcher
 
-from src.core import generate_barcode_from_sku, parse_date
+from src.core import CSV_EXTRA_FIELDS, generate_barcode_from_sku, parse_date
 
 DB_PATH = os.path.join("data", "Registre 1.db")
 
@@ -95,6 +95,9 @@ def initialize_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE product_catalog ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
     if "category" not in existing_catalog_columns:
         conn.execute("ALTER TABLE product_catalog ADD COLUMN category TEXT")
+    for column in CSV_EXTRA_FIELDS:
+        if column not in existing_catalog_columns:
+            conn.execute(f"ALTER TABLE product_catalog ADD COLUMN {column} TEXT")
     for column, col_type in (("original_sku", "TEXT"), ("original_name", "TEXT"), ("original_weight", "REAL")):
         if column not in existing_catalog_columns:
             conn.execute(f"ALTER TABLE product_catalog ADD COLUMN {column} {col_type}")
@@ -480,7 +483,7 @@ def _suggestion_key(value):
     ).split())
 
 
-def _rank_suggestions(rows, term, columns, limit):
+def _rank_suggestions(rows, term, columns, limit, include_fuzzy=True):
     query = _suggestion_key(term)
     if not query:
         return []
@@ -497,7 +500,7 @@ def _rank_suggestions(rows, term, columns, limit):
                 score = (1, 0.0)
             elif query in value:
                 score = (2, 0.0)
-            elif len(query) >= 4 and not query.isdecimal() and column != "sku":
+            elif include_fuzzy and len(query) >= 4 and not query.isdecimal() and column != "sku":
                 words = value.split()
                 window = len(query.split())
                 candidates = [value] + [" ".join(words[start:start + window]) for start in range(len(words))]
@@ -512,18 +515,28 @@ def _rank_suggestions(rows, term, columns, limit):
     return [row for score, index, row in ranked[:limit]]
 
 
-def search_packaging_ingredients(conn, term, limit=8):
-    if not term:
-        return []
-    rows = conn.execute(
+def list_packaging_ingredient_candidates(conn):
+    return conn.execute(
         """
-        WITH available AS (
+        WITH latest_catalog_skus AS (
+            SELECT name, sku
+            FROM (
+                SELECT name, sku,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY LOWER(TRIM(name))
+                           ORDER BY created_at DESC, id DESC
+                       ) AS position
+                FROM product_catalog
+                WHERE COALESCE(sku, '') != ''
+            )
+            WHERE position = 1
+        ),
+        available AS (
             SELECT rm.name, rm.supplier_lot, rm.provenance, rm.supplier, rm.expiry, rm.barcode, rm.created_at,
-                   (SELECT pc.sku FROM product_catalog pc
-                    WHERE LOWER(TRIM(pc.name)) = LOWER(TRIM(rm.name)) AND pc.sku != ''
-                    ORDER BY pc.created_at DESC, pc.id DESC LIMIT 1) AS sku,
+                   COALESCE(pc.sku, '') AS sku,
                    NULL AS mixture_id, NULL AS ingredients_json
             FROM raw_materials rm
+            LEFT JOIN latest_catalog_skus pc ON LOWER(TRIM(pc.name)) = LOWER(TRIM(rm.name))
             UNION ALL
             SELECT name, lot, '', '', expiry, barcode, created_at, sku, id, ingredients_json
             FROM prepared_mixtures
@@ -531,7 +544,36 @@ def search_packaging_ingredients(conn, term, limit=8):
         SELECT * FROM available ORDER BY created_at DESC
         """,
     ).fetchall()
-    return _rank_suggestions(rows, term, ("name", "sku"), limit)
+
+
+def rank_packaging_ingredient_candidates(rows, term, limit=8, include_fuzzy=True):
+    return _rank_suggestions(rows, term, ("name", "sku"), limit, include_fuzzy=include_fuzzy)
+
+
+def search_packaging_ingredients(conn, term, limit=8):
+    if not term:
+        return []
+    return rank_packaging_ingredient_candidates(list_packaging_ingredient_candidates(conn), term, limit)
+
+
+def list_catalog_product_candidates(conn):
+    return conn.execute(
+        """
+        SELECT p.name AS name, p.sku AS sku
+        FROM product_catalog p
+        WHERE p.id = (
+            SELECT id FROM product_catalog p2
+            WHERE LOWER(TRIM(p2.name)) = LOWER(TRIM(p.name))
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        )
+        ORDER BY p.name COLLATE NOCASE
+        """
+    ).fetchall()
+
+
+def rank_catalog_product_candidates(rows, term, limit=8, include_fuzzy=True):
+    return _rank_suggestions(rows, term, ("name", "sku"), limit, include_fuzzy=include_fuzzy)
 
 
 def upsert_catalog_rows(conn: sqlite3.Connection, rows: list[dict], source_file: str) -> int:
@@ -547,6 +589,7 @@ def upsert_catalog_rows(conn: sqlite3.Connection, rows: list[dict], source_file:
         name = item.get("name", "")
         weight = item.get("weight", 0.0)
         category = item.get("category", "")
+        extra_values = [item.get(field, "") for field in CSV_EXTRA_FIELDS]
         if not name:
             continue
         existing = None
@@ -557,13 +600,17 @@ def upsert_catalog_rows(conn: sqlite3.Connection, rows: list[dict], source_file:
             ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE product_catalog SET name = ?, weight = ?, category = ?, source_file = ?, created_at = ? WHERE id = ?",
-                (name, weight, category, source_file, created_at, existing["id"]),
+                "UPDATE product_catalog SET name = ?, weight = ?, category = ?, "
+                + ", ".join(f"{field} = ?" for field in CSV_EXTRA_FIELDS)
+                + ", source_file = ?, created_at = ? WHERE id = ?",
+                (name, weight, category, *extra_values, source_file, created_at, existing["id"]),
             )
         else:
+            columns = ("sku", "name", "weight", "category", *CSV_EXTRA_FIELDS, "source_file", "created_at")
             conn.execute(
-                "INSERT INTO product_catalog (sku, name, weight, category, source_file, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (sku, name, weight, category, source_file, created_at),
+                f"INSERT INTO product_catalog ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                (sku, name, weight, category, *extra_values, source_file, created_at),
             )
         count += 1
     conn.commit()
@@ -606,9 +653,17 @@ def export_catalog_csv(conn, output_path):
     rows = list_catalog_products(conn)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("SKU", "Nom", "Pes", "Categoria"))
-        writer.writerows((row["sku"] or "", row["name"], row["weight"] if row["weight"] is not None else "",
-                         row["category"] or "") for row in rows)
+        writer.writerow(("SKU", "Nom", "Pes", "Categoria", *CSV_EXTRA_FIELDS.values()))
+        writer.writerows(
+            (
+                row["sku"] or "",
+                row["name"],
+                row["weight"] if row["weight"] is not None else "",
+                row["category"] or "",
+                *(row[field] or "" for field in CSV_EXTRA_FIELDS),
+            )
+            for row in rows
+        )
     return len(rows)
 
 
@@ -852,20 +907,7 @@ def search_catalog_products(conn: sqlite3.Connection, term: str, limit: int = 8)
     """
     if not term:
         return []
-    rows = conn.execute(
-        """
-        SELECT p.name AS name, p.sku AS sku
-        FROM product_catalog p
-                WHERE p.id = (
-              SELECT id FROM product_catalog p2
-              WHERE LOWER(TRIM(p2.name)) = LOWER(TRIM(p.name))
-              ORDER BY created_at DESC, id DESC
-              LIMIT 1
-          )
-        ORDER BY p.name COLLATE NOCASE
-        """,
-    ).fetchall()
-    return _rank_suggestions(rows, term, ("name", "sku"), limit)
+    return rank_catalog_product_candidates(list_catalog_product_candidates(conn), term, limit)
 
 
 def list_raw_materials(conn: sqlite3.Connection):

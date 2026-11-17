@@ -44,7 +44,19 @@ def test_catalog_creation_export_and_reference_merge(tmp_path):
         assert export_catalog_csv(conn, output) == 2
         with output.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
-        assert rows[0] == {"SKU": "001", "Nom": "Farina", "Pes": "2.5", "Categoria": "Aliment"}
+        assert rows[0] == {
+            "SKU": "001",
+            "Nom": "Farina",
+            "Pes": "2.5",
+            "Categoria": "Aliment",
+            "Traduccions juntes": "",
+            "Nom científic": "",
+            "Descripció": "",
+            "Preparació": "",
+            "Contraindicacions": "",
+            "Ingredients català": "",
+            "Ingredients Castellà": "",
+        }
         assert rows[1]["Pes"] == ""
         add_raw_material(conn, "Farina", "Supplier", "LOT", "España", "2027-12-01", "RAW")
         nested = [{"provenance": "España", "supplier": "Supplier", "ingredients": [
@@ -162,6 +174,102 @@ def test_parse_csv_mapping_extracts_category_when_given():
     rows = [{"sku": "SKU-1", "nom": "Poma", "pes": "1.2", "cat": "Fruita"}]
     mapped = parse_csv_mapping(rows, sku_field="sku", name_field="nom", weight_field="pes", category_field="cat")
     assert mapped[0]["category"] == "Fruita"
+
+
+def test_parse_csv_mapping_extracts_extra_label_fields():
+    from src.core import CSV_EXTRA_FIELDS, CSV_EXTRA_FIELD_LABELS
+    from src.label_templates import FIELD_LABELS
+
+    row = {
+        "sku": "SKU-1",
+        "nom": "Poma",
+        "pes": "1.2",
+        "traduccions": "Pomme / Manzana",
+        "cientific": "Malus domestica",
+        "desc": "Descripció del producte",
+        "preparacio": "Rentar abans de consumir",
+        "contra": "Cap",
+        "catala": "Poma",
+        "castella": "Manzana",
+    }
+    mapped = parse_csv_mapping(
+        [row],
+        sku_field="sku",
+        name_field="nom",
+        weight_field="pes",
+        extra_fields={
+            "traduccions": "traduccions",
+            "nom_cientific": "cientific",
+            "descripcio": "desc",
+            "preparacio": "preparacio",
+            "contraindicacions": "contra",
+            "ingredients_catala": "catala",
+            "ingredients_castella": "castella",
+        },
+    )[0]
+    assert mapped["traduccions"] == "Pomme / Manzana"
+    assert mapped["nom_cientific"] == "Malus domestica"
+    assert mapped["descripcio"] == "Descripció del producte"
+    assert mapped["preparacio"] == "Rentar abans de consumir"
+    assert mapped["contraindicacions"] == "Cap"
+    assert mapped["ingredients_catala"] == "Poma"
+    assert mapped["ingredients_castella"] == "Manzana"
+    assert set(CSV_EXTRA_FIELDS).issubset(mapped)
+    assert all(FIELD_LABELS[field] == label for field, label in CSV_EXTRA_FIELD_LABELS.items())
+
+
+def test_catalog_import_stores_and_exports_extra_label_fields(tmp_path):
+    import csv
+    from src.core import CSV_EXTRA_FIELDS, parse_csv_mapping
+    from src.db import (
+        export_catalog_csv,
+        get_catalog_row_by_sku,
+        initialize_db,
+        replace_catalog_rows,
+        upsert_catalog_rows,
+    )
+
+    conn = initialize_db(str(tmp_path / "catalog-extra-fields.db"))
+    try:
+        mapped = parse_csv_mapping(
+            [{
+                "sku": "SKU-2",
+                "nom": "Menta",
+                "pes": "0,25",
+                **{column: f"valor {index}" for index, column in enumerate(CSV_EXTRA_FIELDS.values())},
+            }],
+            "sku",
+            "nom",
+            "pes",
+            extra_fields={field: column for field, column in CSV_EXTRA_FIELDS.items()},
+        )
+        assert replace_catalog_rows(conn, mapped, "catalog.csv") == 1
+        updated = parse_csv_mapping(
+            [{
+                "sku": "SKU-2",
+                "nom": "Menta actualitzada",
+                "pes": "0.5",
+                **{column: f"actualitzat {index}" for index, column in enumerate(CSV_EXTRA_FIELDS.values())},
+            }],
+            "sku",
+            "nom",
+            "pes",
+            extra_fields={field: column for field, column in CSV_EXTRA_FIELDS.items()},
+        )
+        assert upsert_catalog_rows(conn, updated, "catalog-updated.csv") == 1
+        product = get_catalog_row_by_sku(conn, "SKU-2")
+        assert product["name"] == "Menta actualitzada"
+        for index, field in enumerate(CSV_EXTRA_FIELDS):
+            assert product[field] == f"actualitzat {index}"
+
+        output = tmp_path / "catalog-export.csv"
+        assert export_catalog_csv(conn, output) == 1
+        with output.open(encoding="utf-8-sig", newline="") as handle:
+            exported = next(csv.DictReader(handle))
+        for index, column in enumerate(CSV_EXTRA_FIELDS.values()):
+            assert exported[column] == f"actualitzat {index}"
+    finally:
+        conn.close()
 
 
 def test_rank_recipes_matches_by_sku_or_name_and_orders_by_score():

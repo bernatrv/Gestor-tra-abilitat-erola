@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+from src.core import CSV_EXTRA_FIELD_LABELS
 from src.db import get_setting, set_setting
 
 
@@ -21,6 +22,7 @@ FIELD_LABELS = {
     "origen": "Origen", "pes_kg": "Pes (valor en kg)", "pes": "Pes amb unitat kg",
     "data_envasat": "Data d'envasat", "codi_barres": "Codi de barres",
     "proveidor": "Proveïdor (recepció)", "data_recepcio": "Data de recepció",
+    **CSV_EXTRA_FIELD_LABELS,
 }
 ACTION_LABELS = {"recepcio": "Recepció de productes"}
 MAX_TEMPLATE_BYTES = 16 * 1024 * 1024

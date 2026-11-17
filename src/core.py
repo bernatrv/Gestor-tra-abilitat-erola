@@ -4,6 +4,25 @@ from calendar import monthrange
 from datetime import date, datetime
 from typing import Iterable
 
+CSV_EXTRA_FIELDS = {
+    "traduccions": "Traduccions juntes",
+    "nom_cientific": "Nom científic",
+    "descripcio": "Descripció",
+    "preparacio": "Preparació",
+    "contraindicacions": "Contraindicacions",
+    "ingredients_catala": "Ingredients català",
+    "ingredients_castella": "Ingredients Castellà",
+}
+CSV_EXTRA_FIELD_LABELS = {
+    "traduccions": "Traduccions",
+    "nom_cientific": "Nom científic",
+    "descripcio": "Descripció",
+    "preparacio": "Preparació",
+    "contraindicacions": "Contraindicacions",
+    "ingredients_catala": "Ingredients català",
+    "ingredients_castella": "Ingredients Castellà",
+}
+
 
 def expiry_status(value, reference_date=None):
     expiry = parse_date(value)
@@ -125,8 +144,13 @@ def parse_csv_mapping(
     name_field: str,
     weight_field: str,
     category_field: str | None = None,
+    extra_fields: dict[str, str] | None = None,
 ) -> list[dict]:
     """Normalitza les files llegides d'un CSV segons les columnes escollides."""
+    extra_fields = extra_fields or {}
+    unsupported_fields = set(extra_fields) - CSV_EXTRA_FIELDS.keys()
+    if unsupported_fields:
+        raise ValueError(f"Camp CSV no admès: {sorted(unsupported_fields)[0]}")
     mapped: list[dict] = []
     for row in rows:
         sku = str(row.get(sku_field, "")).strip()
@@ -138,7 +162,11 @@ def parse_csv_mapping(
         except ValueError:
             weight = 0.0
         if sku or name:
-            mapped.append({"sku": sku, "name": name, "weight": weight, "category": category})
+            item = {"sku": sku, "name": name, "weight": weight, "category": category}
+            for field, source_field in extra_fields.items():
+                value = row.get(source_field, "") if source_field else ""
+                item[field] = str(value).strip() if value is not None else ""
+            mapped.append(item)
     return mapped
 
 

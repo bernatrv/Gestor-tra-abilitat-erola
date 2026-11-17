@@ -368,9 +368,124 @@ def test_suggestion_fields_show_accent_insensitive_and_fuzzy_matches(application
     entry = getattr(app, field)
     entry.insert(0, query)
     getattr(app, handler)(SimpleNamespace(keysym="a"))
+    kind = {
+        "package_ingredient_entry": "package_ingredient",
+        "package_final_product_entry": "package_product",
+    }.get(field)
+    if kind:
+        state = app._progressive_suggestion_states[kind]
+        generation = state["generation"]
+        job = app._progressive_suggestion_jobs.pop(kind)
+        app.after_cancel(job)
+        app._run_progressive_suggestion_batch(kind, generation)
     assert app.suggestions_listbox is not None
     assert expected in app.suggestions_listbox.get(0)
     app._hide_suggestions()
+
+
+def test_packaging_exact_suggestions_are_immediate_and_fuzzy_work_is_deferred(application, monkeypatch):
+    from difflib import SequenceMatcher
+    from types import SimpleNamespace
+
+    app, app_module, _ = application
+    upsert_catalog_rows(
+        app.conn,
+        [{"sku": "001", "name": "Marialluïsa", "weight": 1}],
+        source_file="test",
+    )
+    add_raw_material(app.conn, "Marialluïsa", "El Reloj", "ENTRY-1", "Català", "2027-12-01", "RAW-1")
+    sequence_matcher = Mock(wraps=SequenceMatcher)
+    monkeypatch.setattr(app_module, "SequenceMatcher", sequence_matcher)
+    app.notebook.select(app.envasat_tab)
+    app.update()
+
+    entry = app.package_ingredient_entry
+    entry.insert(0, "Marialluïsa")
+    app._on_package_ingredient_keyrelease(SimpleNamespace(keysym="a"))
+    assert app.suggestions_listbox.get(0).startswith("Marialluïsa")
+    assert sequence_matcher.call_count == 0
+
+    entry.delete(0, "end")
+    entry.insert(0, "Marialuisa")
+    app._on_package_ingredient_keyrelease(SimpleNamespace(keysym="a"))
+    assert sequence_matcher.call_count == 0
+    state = app._progressive_suggestion_states["package_ingredient"]
+    generation = state["generation"]
+    job = app._progressive_suggestion_jobs.pop("package_ingredient")
+    app.after_cancel(job)
+    app._run_progressive_suggestion_batch("package_ingredient", generation)
+    assert sequence_matcher.call_count > 0
+    assert "Marialluïsa" in app.suggestions_listbox.get(0)
+
+
+def test_obsolete_packaging_fuzzy_search_is_cancelled(application, monkeypatch):
+    from difflib import SequenceMatcher
+    from types import SimpleNamespace
+
+    app, app_module, _ = application
+    add_raw_material(app.conn, "Marialluïsa", "El Reloj", "ENTRY-1", "Català", "2027-12-01", "RAW-1")
+    sequence_matcher = Mock(wraps=SequenceMatcher)
+    monkeypatch.setattr(app_module, "SequenceMatcher", sequence_matcher)
+    app.notebook.select(app.envasat_tab)
+    app.update()
+
+    entry = app.package_ingredient_entry
+    entry.insert(0, "Marialuisa")
+    app._on_package_ingredient_keyrelease(SimpleNamespace(keysym="a"))
+    old_state = app._progressive_suggestion_states["package_ingredient"]
+    old_generation = old_state["generation"]
+    old_job = app._progressive_suggestion_jobs.pop("package_ingredient")
+    app.after_cancel(old_job)
+
+    entry.delete(0, "end")
+    entry.insert(0, "NoMatch")
+    app._on_package_ingredient_keyrelease(SimpleNamespace(keysym="h"))
+    new_state = app._progressive_suggestion_states["package_ingredient"]
+    assert new_state["generation"] != old_generation
+    app._run_progressive_suggestion_batch("package_ingredient", old_generation)
+    assert app._progressive_suggestion_states["package_ingredient"] is new_state
+    assert sequence_matcher.call_count == 0
+
+    new_job = app._progressive_suggestion_jobs.pop("package_ingredient")
+    app.after_cancel(new_job)
+    app._run_progressive_suggestion_batch("package_ingredient", new_state["generation"])
+    assert sequence_matcher.call_count > 0
+    assert app.suggestions_listbox is None or app.suggestions_listbox.size() == 0
+
+
+def test_packaging_approximate_suggestions_are_added_in_batches(application):
+    from types import SimpleNamespace
+
+    app, _, _ = application
+    for index in range(30):
+        add_raw_material(
+            app.conn,
+            f"Marialluïsa {index:02}",
+            "El Reloj",
+            f"ENTRY-{index}",
+            "Català",
+            "2027-12-01",
+            f"RAW-{index}",
+        )
+    app.notebook.select(app.envasat_tab)
+    app.update()
+    app.package_ingredient_entry.insert(0, "Marialuisa")
+    app._on_package_ingredient_keyrelease(SimpleNamespace(keysym="a"))
+    state = app._progressive_suggestion_states["package_ingredient"]
+    generation = state["generation"]
+    job = app._progressive_suggestion_jobs.pop("package_ingredient")
+    app.after_cancel(job)
+    app._run_progressive_suggestion_batch("package_ingredient", generation)
+
+    assert state["cursor"] == 24
+    assert app.suggestions_listbox is not None
+    assert app.suggestions_listbox.size() > 0
+    assert "Marialluïsa" in app.suggestions_listbox.get(0)
+    next_job = app._progressive_suggestion_jobs.pop("package_ingredient")
+    app.after_cancel(next_job)
+    app._run_progressive_suggestion_batch("package_ingredient", generation)
+    assert state["cursor"] == 30
+    assert app.suggestions_listbox.size() == 8
 
 
 @pytest.mark.parametrize("changed", [
@@ -904,15 +1019,22 @@ def test_template_manager_opens_with_actions_without_changing_settings(applicati
 def test_packaging_uses_assigned_template_and_preserves_saved_job(application, monkeypatch, tmp_path, prepared):
     import zipfile
     from src import label_templates as templates
+    from src.core import CSV_EXTRA_FIELDS
 
     app, app_module, printer = application
     path = tmp_path / "Bossa.lbx"
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/><objectStyle objectName="Lot"/></label>')
+        objects = ['<objectStyle objectName="Producte"/>', '<objectStyle objectName="Lot"/>']
+        objects.extend(f'<objectStyle objectName="{field}"/>' for field in CSV_EXTRA_FIELDS)
+        archive.writestr("label.xml", f"<label>{''.join(objects)}</label>")
     identity = templates.import_label_template(app.conn, path)
-    templates.configure_label_template(app.conn, identity, "Bossa", {"Producte": "producte", "Lot": "lot"})
+    template_fields = {"Producte": "producte", "Lot": "lot"}
+    template_fields.update({field: field for field in CSV_EXTRA_FIELDS})
+    templates.configure_label_template(app.conn, identity, "Bossa", template_fields)
     templates.assign_product_template(app.conn, [{"sku": "001", "name": "Arros"}], identity)
     templates.set_templates_enabled(app.conn, True)
+    metadata = {field: f"valor {index}" for index, field in enumerate(CSV_EXTRA_FIELDS)}
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Arros", "weight": 1, **metadata}], "test.csv")
     backend = Mock(return_value={"status": "printed"})
     monkeypatch.setattr(app_module, "print_template_job", backend)
     if prepared:
@@ -931,7 +1053,8 @@ def test_packaging_uses_assigned_template_and_preserves_saved_job(application, m
         job = json.load(source)
     assert job["copies"] == 3
     assert job["values"]["producte"] == "Arros"
-    assert job["template"]["fields"] == {"Producte": "producte", "Lot": "lot"}
+    assert job["template"]["fields"] == template_fields
+    assert {field: job["values"][field] for field in CSV_EXTRA_FIELDS} == metadata
     snapshot = job["template"]["content"]
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("label.xml", '<label><objectStyle objectName="Updated"/></label>')
@@ -999,13 +1122,18 @@ def test_template_manager_assigns_actions_and_supports_undo(application, receipt
 @pytest.mark.parametrize("reprint", [False, True])
 def test_receipts_use_action_template_with_all_receipt_values(application, receipt_template, reprint):
     from src import label_templates as templates
+    from src.core import CSV_EXTRA_FIELDS
 
     app, app_module, printer = application
     identity, backend = receipt_template
-    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Farina", "weight": 1}], "test.csv")
+    metadata = {field: f"valor {index}" for index, field in enumerate(CSV_EXTRA_FIELDS)}
+    upsert_catalog_rows(
+        app.conn, [{"sku": "001", "name": "Farina", "weight": 1, **metadata}], "test.csv"
+    )
+    template_fields = ("producte", "sku", "lot", "origen", "caducitat", "caducitat_dmy",
+                       "codi_barres", "proveidor", "data_recepcio", *CSV_EXTRA_FIELDS)
     templates.configure_label_template(app.conn, identity, "Recepció", {
-        field: field for field in ("producte", "sku", "lot", "origen", "caducitat", "caducitat_dmy",
-                                  "codi_barres", "proveidor", "data_recepcio")
+        field: field for field in template_fields
     })
     if reprint:
         material = app._register_received_material("Farina", "Supplier", "ENTRY-1", "Catalunya", "2027-12-01")
@@ -1031,6 +1159,7 @@ def test_receipts_use_action_template_with_all_receipt_values(application, recei
         "producte": "Farina", "sku": "001", "lot": "ENTRY-1", "origen": "Catalunya",
         "caducitat": "2027-12-01", "caducitat_dmy": "01/12/2027", "codi_barres": material["barcode"],
         "proveidor": "Supplier", "data_recepcio": material["created_at"][:10],
+        **metadata,
     }
     assert job["template"]["name"] == "Recepció"
     assert not templates.load_template_config(app.conn)["enabled"]
@@ -1732,7 +1861,11 @@ def test_packaging_ingredients_fill_space_above_quantity(application, size):
     app.update()
     panel = app.package_form_container.master
     quantity_row = app.package_quantity_entry.master
-    assert not app.package_status_label.winfo_ismapped()
+    assert not any(
+        isinstance(child, app_module.tk.Label)
+        and child.cget("text").startswith("Intro afegeix l'ingredient")
+        for child in app.package_form_container.winfo_children()
+    )
     assert panel.winfo_rooty() + panel.winfo_height() - (quantity_row.winfo_rooty() + quantity_row.winfo_height()) <= 4
     panes = app.package_vertical_panes
     bottom = app.nametowidget(panes.panes()[1])
@@ -1744,14 +1877,31 @@ def test_packaging_ingredients_fill_space_above_quantity(application, size):
     app.update()
     assert abs(app.ingredients_list.winfo_height() - initial_height - delta) <= 2
     assert panel.winfo_rooty() + panel.winfo_height() - (quantity_row.winfo_rooty() + quantity_row.winfo_height()) <= 4
+    status = app.package_status.get()
     app.package_status.set("Producte final seleccionat: Farina.")
     app.update()
-    assert app.package_status_label.winfo_ismapped()
-    assert quantity_row.winfo_rooty() + quantity_row.winfo_height() <= app.package_status_label.winfo_rooty()
-    app.package_status.set("")
-    app.update()
-    assert not app.package_status_label.winfo_ismapped()
+    assert app.package_status.get() != status
     assert abs(app.ingredients_list.winfo_height() - initial_height - delta) <= 2
+    assert panel.winfo_rooty() + panel.winfo_height() - (quantity_row.winfo_rooty() + quantity_row.winfo_height()) <= 4
+
+
+@pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
+def test_packaging_quantity_label_entry_and_clear_button_share_row(application, size):
+    app, _, _ = application
+    app.geometry(size)
+    app.notebook.select(app.envasat_tab)
+    app.update()
+
+    controls = (
+        app.package_quantity_label,
+        app.package_quantity_entry,
+        app.package_clear_button,
+    )
+    assert len({control.master for control in controls}) == 1
+    centers = {control.winfo_rooty() + control.winfo_height() / 2 for control in controls}
+    assert max(centers) - min(centers) <= 2
+    assert app.package_quantity_entry.winfo_rootx() > app.package_quantity_label.winfo_rootx()
+    assert app.package_clear_button.winfo_rootx() > app.package_quantity_entry.winfo_rootx()
 
 
 @pytest.mark.parametrize("size", ["1000x550", "1000x650", "1200x760"])
