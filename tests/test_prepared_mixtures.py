@@ -304,6 +304,35 @@ def test_history_global_search_separators_clear_and_suggestions(application, siz
     assert clear.winfo_rootx() + clear.winfo_width() <= app.winfo_rootx() + app.winfo_width()
 
 
+def test_suggestion_popup_dismisses_outside_click_and_focus_loss(application, monkeypatch):
+    from types import SimpleNamespace
+
+    app, app_module, printer = application
+    app.notebook.select(app.envasat_tab)
+    app.update()
+    anchor = app.package_final_product_entry
+    app._show_suggestions(anchor, ["Arros"], ["Arros"], lambda item: None)
+    app.update()
+    popup = app.suggestions_window
+    assert popup.state() == "normal"
+
+    app._dismiss_suggestions_on_outside_click(SimpleNamespace(widget=app.suggestions_listbox))
+    assert popup.state() == "normal"
+    app._dismiss_suggestions_on_outside_click(SimpleNamespace(widget=anchor))
+    assert popup.state() == "normal"
+    app.package_quantity_entry.event_generate("<ButtonPress-1>")
+    app.update()
+    assert popup.state() == "withdrawn"
+    assert app.suggestions_anchor_entry is None
+
+    app._show_suggestions(anchor, ["Arros"], ["Arros"], lambda item: None)
+    monkeypatch.setattr(app, "focus_get", Mock(return_value=None))
+    anchor.event_generate("<FocusOut>")
+    app.update()
+    assert app.suggestions_window.state() == "withdrawn"
+    assert app.suggestions_anchor_entry is None
+
+
 def test_history_session_selection_resets_when_database_changes(application, tmp_path):
     app, app_module, printer = application
     other_session = create_session(app.conn)
@@ -1117,6 +1146,149 @@ def test_template_manager_assigns_actions_and_supports_undo(application, receipt
     assert templates.load_template_config(app.conn)["actions"]["recepcio"] == identity
     app.redo_action()
     assert "recepcio" not in templates.load_template_config(app.conn)["actions"]
+
+
+def test_template_manager_prints_a_test_label_from_packaging_history(application, monkeypatch, tmp_path):
+    import zipfile
+    import src.app as app_module
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
+    add_packaged_product(
+        app.conn, "Arros", "PACK-1", "ENTRY-1", "Catalunya", "2099-12-01",
+        "PACK-1", 2, 1, app.session_id, [], "001",
+    )
+    path = tmp_path / "Bossa.lbx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "label.xml",
+            '<label><objectStyle objectName="Producte"/><objectStyle objectName="Lot"/><objectStyle objectName="Data"/></label>',
+        )
+    identity = templates.import_label_template(app.conn, path)
+    templates.configure_label_template(
+        app.conn, identity, "Bossa", {"Producte": "producte", "Lot": "lot", "Data": "data_envasat"},
+    )
+    backend = Mock(return_value={"status": "printed", "message": "OK"})
+    monkeypatch.setattr(app_module, "print_template_job", backend)
+
+    manager = app._show_template_manager()
+    manager.templates_tree.selection_set(identity)
+    manager._select_template()
+    test_dialog = manager._test_template()
+    test_dialog.print_button.invoke()
+
+    assert backend.call_count == 1
+    with open(backend.call_args.args[0], encoding="utf-8") as source:
+        job = json.load(source)
+    assert job["copies"] == 1
+    assert job["values"]["producte"] == "Arros"
+    assert job["values"]["lot"] == "PACK-1"
+    assert job["values"]["data_envasat"] == list_packaged_products(app.conn)[0]["created_at"][:10]
+    assert len(list_packaged_products(app.conn)) == 1
+    test_dialog.close_button.invoke()
+    manager.destroy()
+
+
+def test_template_test_image_shows_values_and_uses_same_data_as_history_print(application, monkeypatch, tmp_path):
+    import zipfile
+    import src.template_manager as manager_module
+    from src import label_templates as templates
+
+    app, app_module, printer = application
+    monkeypatch.setattr(app_module.messagebox, "showinfo", Mock())
+    upsert_catalog_rows(app.conn, [{"sku": "001", "name": "Arros", "weight": 1}], "test.csv")
+    add_packaged_product(
+        app.conn, "Arros", "PACK-1", "ENTRY-1", "", "2099-12-01",
+        "PACK-1", 2, 1, app.session_id, [], None,
+    )
+    path = tmp_path / "Bossa.lbx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "label.xml",
+            '<label><objectStyle objectName="Producte"/><objectStyle objectName="SKU"/>'
+            '<objectStyle objectName="Origen"/><objectStyle objectName="Logo"/></label>',
+        )
+    identity = templates.import_label_template(app.conn, path)
+    templates.configure_label_template(
+        app.conn, identity, "Bossa", {"Producte": "producte", "SKU": "sku", "Origen": "origen"},
+    )
+    templates.assign_product_template(app.conn, [{"sku": "", "name": "Arros"}], identity)
+    templates.set_templates_enabled(app.conn, True)
+    backend = Mock(return_value={"status": "printed"})
+    monkeypatch.setattr(app_module, "print_template_job", backend)
+    export = Mock(return_value={"status": "saved", "message": "Desat"})
+    monkeypatch.setattr(manager_module, "export_template_job_image", export)
+    monkeypatch.setattr(manager_module.filedialog, "asksaveasfilename", Mock(return_value=str(tmp_path / "preview.png")))
+
+    manager = app._show_template_manager()
+    manager.templates_tree.selection_set(identity)
+    manager._select_template()
+    dialog = manager._test_template()
+    displayed = {values[0]: values[1:] for values in (
+        dialog.values_tree.item(row, "values") for row in dialog.values_tree.get_children()
+    )}
+    assert displayed["SKU"][1] == "(buit)"
+    assert displayed["Origen"][1] == "(buit)"
+    assert displayed["Producte"][1] == "Arros"
+    assert displayed["Logo"][1] == "(fix a la plantilla)"
+
+    dialog.image_button.invoke()
+    assert export.call_count == 1
+    with open(export.call_args.args[0], encoding="utf-8") as source:
+        image_job = json.load(source)
+    assert export.call_args.args[1] == str(tmp_path / "preview.png")
+    assert backend.call_count == 0
+
+    app._print_packaged_history_label(dict(list_packaged_products(app.conn)[0]))
+    with open(backend.call_args.args[0], encoding="utf-8") as source:
+        printed_job = json.load(source)
+    assert image_job["values"] == printed_job["values"]
+    assert image_job["values"]["sku"] == ""
+    dialog.close_button.invoke()
+    manager.destroy()
+
+
+def test_print_packaged_label_without_registering_envasat(application):
+    app, app_module, printer = application
+    app.package_ingredients = [{
+        "name": "Farina", "supplier_lot": "ENTRY-1", "provenance": "Catalunya", "expiry": "2099-12-01",
+    }]
+    app.package_final_product = {"name": "Farina envasada", "sku": None}
+    app.package_quantity_entry.insert(0, "4")
+    history_before = len(app.history.entries)
+
+    app.package_print_button.invoke()
+
+    assert app.conn.execute("SELECT COUNT(*) FROM packaged_products").fetchone()[0] == 0
+    assert app.conn.execute("SELECT COUNT(*) FROM prepared_mixtures").fetchone()[0] == 0
+    assert len(app.history.entries) == history_before
+    assert printer.call_count == 1
+    assert "sense registrar l'envasat" in app.package_status.get()
+
+
+def test_packaged_history_has_per_row_print_button_on_left(application):
+    from PIL import Image
+
+    app, app_module, printer = application
+    product_id = add_packaged_product(
+        app.conn, "Farina", "PACK-1", "ENTRY-1", "Catalunya", "2099-12-01",
+        "PACK-1", 2, 1, app.session_id, [], "001",
+    )
+    app.notebook.select(app.envasat_tab)
+    app.populate_package_history()
+    app.update()
+
+    button = app._package_print_buttons[str(product_id)]
+    bounds = app.package_history_tree.bbox(str(product_id), "Etiqueta")
+    assert button.winfo_ismapped()
+    assert bounds and button.winfo_x() == bounds[0] + (bounds[2] - button.winfo_width()) // 2
+    button.invoke()
+
+    assert printer.call_count == 1
+    with Image.open(printer.call_args.args[0]) as image:
+        assert json.loads(image.info["erola.label.v1"])["label_type"] == "packaged"
+    assert len(list_packaged_products(app.conn)) == 1
 
 
 @pytest.mark.parametrize("reprint", [False, True])

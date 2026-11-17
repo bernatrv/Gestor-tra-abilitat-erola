@@ -175,6 +175,8 @@ class TraceabilityApp(tk.Tk):
         self.suggestions_items: list = []
         self.suggestions_apply = None
         self.suggestions_anchor_entry: tk.Entry | None = None
+        self.bind_all("<ButtonPress-1>", self._dismiss_suggestions_on_outside_click, add="+")
+        self.bind("<FocusOut>", self._schedule_suggestion_focus_check, add="+")
         self._progressive_suggestion_jobs = {}
         self._progressive_suggestion_generations = {"package_ingredient": 0, "package_product": 0}
         self._progressive_suggestion_states = {}
@@ -701,6 +703,8 @@ class TraceabilityApp(tk.Tk):
             tree.heading(column_name, text=base_text + suffix)
         if tree is getattr(self, "prepared_mixture_tree", None):
             self._schedule_prepared_print_buttons()
+        if tree is getattr(self, "package_history_tree", None):
+            self._schedule_package_print_buttons()
 
     def build_recepcion_tab(self):
         frame = self.recepcion_tab
@@ -1304,11 +1308,34 @@ class TraceabilityApp(tk.Tk):
             )
 
     def _hide_suggestions(self):
+        self._cancel_all_progressive_suggestion_searches()
         if self.suggestions_window is not None:
             self.suggestions_window.withdraw()
         self.suggestions_items = []
         self.suggestions_apply = None
         self.suggestions_anchor_entry = None
+
+    def _dismiss_suggestions_on_outside_click(self, event):
+        if self.suggestions_window is None or self.suggestions_window.state() != "normal":
+            return
+        if event.widget is self.suggestions_anchor_entry:
+            return
+        try:
+            if event.widget.winfo_toplevel() is self.suggestions_window:
+                return
+        except tk.TclError:
+            pass
+        self._hide_suggestions()
+
+    def _schedule_suggestion_focus_check(self, event=None):
+        if self.suggestions_window is not None and self.suggestions_window.state() == "normal":
+            self.after_idle(self._hide_suggestions_if_focus_left)
+
+    def _hide_suggestions_if_focus_left(self):
+        if self.suggestions_window is None or self.suggestions_window.state() != "normal":
+            return
+        if self.focus_get() not in (self.suggestions_anchor_entry, self.suggestions_listbox):
+            self._hide_suggestions()
 
     def _on_suggestions_down_from(self, anchor_entry):
         if self.suggestions_window is None or self.suggestions_window.state() != "normal":
@@ -1375,7 +1402,7 @@ class TraceabilityApp(tk.Tk):
         )
         self.package_history_tree = ttk.Treeview(
             history_frame,
-            columns=("Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data", "Codi barreja", "Pes (kg)"),
+            columns=("Etiqueta", "Nom", "SKU", "Lot origen", "Lot sortida", "Caducitat", "Procedència", "Quantitat", "Data", "Codi barreja", "Pes (kg)"),
             show="headings",
             height=10,
         )
@@ -1384,6 +1411,22 @@ class TraceabilityApp(tk.Tk):
             self.package_history_tree.column(text, width=150)
         self.package_history_tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
         self._attach_scrollbars(self.package_history_tree, horizontal=True)
+        ttk.Style(self).configure("ReceiptPrint.TButton", font=("Segoe UI Symbol", 9), padding=0)
+        self.package_history_tree.column("Etiqueta", width=28, minwidth=28, stretch=False)
+        self.package_history_tree.heading("Etiqueta", text="", command="")
+        self._package_print_buttons = {}
+        self._package_print_tooltip = None
+        self._package_print_position_job = None
+        for axis in ("x", "y"):
+            scroll_command = self.package_history_tree.cget(f"{axis}scrollcommand")
+
+            def on_scroll(first, last, command=scroll_command):
+                self.package_history_tree.tk.call(command, first, last)
+                self._schedule_package_print_buttons()
+
+            self.package_history_tree.configure(**{f"{axis}scrollcommand": on_scroll})
+        self.package_history_tree.bind("<Configure>", self._schedule_package_print_buttons)
+        self.package_history_tree.bind("<ButtonRelease-1>", self._schedule_package_print_buttons)
         self.package_history_tree.bind("<Double-1>", self._on_package_history_select)
         self._setup_sortable_tree(self.package_history_tree, numeric_columns=("Quantitat", "Pes (kg)"))
         self._schedule_package_minimum_height()
@@ -1463,7 +1506,11 @@ class TraceabilityApp(tk.Tk):
             quantity_row, text="✕", command=self._on_clear_package_form_clicked, width=3,
             fg="white", bg="#c0392b",
         )
-        self.package_clear_button.grid(row=0, column=2, sticky="e", padx=(4, 0))
+        self.package_print_button = ttk.Button(
+            quantity_row, text="Imprimir etiqueta", command=self._print_package_label_without_recording,
+        )
+        self.package_print_button.grid(row=0, column=2, sticky="e", padx=(4, 0))
+        self.package_clear_button.grid(row=0, column=3, sticky="e", padx=(4, 0))
 
     def _build_package_recipe_panel(self, frame):
         frame.grid_columnconfigure(0, weight=1)
@@ -2361,34 +2408,80 @@ class TraceabilityApp(tk.Tk):
         except Exception as exc:
             messagebox.showwarning("Etiqueta no generada", str(exc))
 
-    def _print_packaged_product_labels(self, name, sku, lot, provenance, expiry, weight, copies):
+    def _packaged_template_values(self, template, name, sku, lot, provenance, expiry, weight, packed_date=None):
+        expiry_date = parse_date(expiry)
+        catalog_product = get_catalog_row_by_sku(self.conn, sku) if sku else None
+        if catalog_product is None:
+            catalog_product = get_catalog_row_by_name(self.conn, name)
+        values = {
+            "producte": name, "sku": sku or "", "lot": lot, "origen": provenance or "",
+            "caducitat": expiry, "caducitat_dmy": expiry_date.strftime("%d/%m/%Y") if expiry_date else "",
+            "pes_kg": f"{weight:g}" if weight is not None else "",
+            "pes": f"{weight:g} kg" if weight is not None else "",
+            "data_envasat": packed_date or date.today().isoformat(), "codi_barres": lot,
+        }
+        values.update({
+            field: (catalog_product[field] or "") if catalog_product else ""
+            for field in CSV_EXTRA_FIELDS
+            if field in template["fields"].values()
+        })
+        return values
+
+    def _print_packaged_product_labels(self, name, sku, lot, provenance, expiry, weight, copies, packed_date=None):
         try:
             template = get_product_template(self.conn, sku, name)
             if template is None:
                 paths = [create_packaged_label_image(name, lot, provenance, expiry, weight=weight) for index in range(copies)]
             else:
-                expiry_date = parse_date(expiry)
-                catalog_product = get_catalog_row_by_sku(self.conn, sku) if sku else None
-                if catalog_product is None:
-                    catalog_product = get_catalog_row_by_name(self.conn, name)
-                template_fields = set(template["fields"].values())
-                values = {
-                    "producte": name, "sku": sku or "", "lot": lot, "origen": provenance or "",
-                    "caducitat": expiry, "caducitat_dmy": expiry_date.strftime("%d/%m/%Y") if expiry_date else "",
-                    "pes_kg": f"{weight:g}" if weight is not None else "",
-                    "pes": f"{weight:g} kg" if weight is not None else "",
-                    "data_envasat": date.today().isoformat(), "codi_barres": lot,
-                }
-                values.update({
-                    field: (catalog_product[field] or "") if catalog_product else ""
-                    for field in CSV_EXTRA_FIELDS
-                    if field in template_fields
-                })
+                values = self._packaged_template_values(template, name, sku, lot, provenance, expiry, weight, packed_date)
                 paths = [create_template_label_job(template, values, copies)]
             return self._print_saved_labels(paths)
         except Exception as exc:
             messagebox.showwarning("Etiquetes no generades", str(exc), parent=self)
             return {"status": "error", "message": str(exc)}
+
+    def _print_package_label_without_recording(self):
+        if not self.package_ingredients:
+            messagebox.showwarning("Sense ingredients", "Afegeix almenys un ingredient abans d'imprimir l'etiqueta.", parent=self)
+            self.package_ingredient_entry.focus_set()
+            return "break"
+        if self.package_final_product is None:
+            messagebox.showwarning("Producte final no definit", "Selecciona el producte final abans d'imprimir l'etiqueta.", parent=self)
+            self.package_final_product_entry.focus_set()
+            return "break"
+
+        try:
+            expiry_date = compute_expiry_from_ingredients(self.package_ingredients)
+        except ValueError as exc:
+            messagebox.showerror("Caducitat invàlida", str(exc), parent=self)
+            return "break"
+
+        product_name = self.package_final_product["name"]
+        sku = self.package_final_product.get("sku") or ""
+        if self.package_reuse_lot:
+            packed_lot = self.package_reuse_lot
+        else:
+            sequence = count_packed_lots_for_sku_on_date(self.conn, sku, date.today().isoformat()) + 1
+            if sequence > 99:
+                messagebox.showerror("Límit assolit", "Ja s'han generat 99 lots de sortida avui per aquest SKU.", parent=self)
+                return "break"
+            packed_lot = generate_daily_sequential_lot(sequence)
+
+        if len(self.package_ingredients) == 1:
+            provenance = self.package_ingredients[0].get("provenance") or ""
+        else:
+            provenance = ""
+        catalog_product = get_catalog_row_by_sku(self.conn, sku) if sku else None
+        weight = (catalog_product["weight"] if catalog_product else get_catalog_weight_by_name(self.conn, product_name)) or 0.0
+        self._warn_packaging_expiry(self.package_ingredients)
+        result = self._print_packaged_product_labels(
+            product_name, sku, packed_lot, provenance, str(expiry_date), weight, 1,
+        )
+        if result.get("status") == "printed":
+            self.package_status.set(f"Etiqueta enviada sense registrar l'envasat | Lot {packed_lot}.")
+        else:
+            self.package_status.set(f"Etiqueta generada sense registrar l'envasat | Lot {packed_lot}.")
+        return "break"
 
     def _clear_package_form(self):
         self.package_ingredients = []
@@ -2501,6 +2594,10 @@ class TraceabilityApp(tk.Tk):
         self.package_quantity_entry.focus_set()
 
     def populate_package_history(self):
+        self._hide_package_print_tooltip()
+        for button in self._package_print_buttons.values():
+            button.destroy()
+        self._package_print_buttons.clear()
         products = list_packaged_products(self.conn)
         for row in self.package_history_tree.get_children():
             self.package_history_tree.delete(row)
@@ -2511,8 +2608,53 @@ class TraceabilityApp(tk.Tk):
             self._package_history_rows[iid] = row
             self.package_history_tree.insert(
                 "", "end", iid=iid,
-                values=(row["name"], sku, row["supplier_lot"], row["packed_lot"], row["expiry"], row["provenance"], row["quantity"], row["created_at"], row["prepared_mixture_barcode"] or "", f"{row['weight']:g}" if row["weight"] is not None else ""),
+                values=("", row["name"], sku, row["supplier_lot"], row["packed_lot"], row["expiry"], row["provenance"], row["quantity"], row["created_at"], row["prepared_mixture_barcode"] or "", f"{row['weight']:g}" if row["weight"] is not None else ""),
             )
+            button = ttk.Button(
+                self.package_history_tree, text="\U0001f5a8", width=1, style="ReceiptPrint.TButton",
+                command=lambda packaged=dict(row): self._print_packaged_history_label(packaged), takefocus=False,
+            )
+            self._package_print_buttons[iid] = button
+            button.bind("<Enter>", self._show_package_print_tooltip)
+            button.bind("<Leave>", self._hide_package_print_tooltip)
+            button.bind("<ButtonPress-1>", self._hide_package_print_tooltip)
+        self._reapply_tree_sort(self.package_history_tree)
+        self._schedule_package_print_buttons()
+
+    def _print_packaged_history_label(self, packaged):
+        return self._print_packaged_product_labels(
+            packaged["name"], packaged["sku"] or "", packaged["packed_lot"],
+            packaged["provenance"] or "", packaged["expiry"], packaged["weight"], 1,
+            packed_date=(packaged["created_at"] or "")[:10],
+        )
+
+    def _schedule_package_print_buttons(self, event=None):
+        if self._package_print_position_job is None:
+            self._package_print_position_job = self.after_idle(self._position_package_print_buttons)
+
+    def _position_package_print_buttons(self):
+        self._package_print_position_job = None
+        for iid, button in self._package_print_buttons.items():
+            bounds = self.package_history_tree.bbox(iid, "Etiqueta")
+            if bounds and bounds[0] >= 0 and bounds[0] + bounds[2] <= self.package_history_tree.winfo_width():
+                left, top, width, height = bounds
+                size = min(width - 4, height - 2)
+                button.place(x=left + (width - size) // 2, y=top + 1, width=size, height=size)
+            else:
+                button.place_forget()
+
+    def _show_package_print_tooltip(self, event):
+        self._hide_package_print_tooltip()
+        tooltip = tk.Toplevel(self.package_history_tree)
+        tooltip.overrideredirect(True)
+        tooltip.geometry(f"+{event.widget.winfo_rootx()}+{event.widget.winfo_rooty() + event.widget.winfo_height() + 4}")
+        tk.Label(tooltip, text="Imprimir l'etiqueta d'envasat", relief="solid", borderwidth=1, padx=5, pady=2).pack()
+        self._package_print_tooltip = tooltip
+
+    def _hide_package_print_tooltip(self, event=None):
+        if self._package_print_tooltip is not None:
+            self._package_print_tooltip.destroy()
+            self._package_print_tooltip = None
 
     def build_csv_tab(self):
         self.csv_tab.grid_columnconfigure(0, weight=1)

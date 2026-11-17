@@ -23,7 +23,7 @@ def test_bpac_factory_marks_methods_without_com_type_information(monkeypatch):
     assert _create_bpac_document() is document
     dispatch.assert_called_once_with("bpac.Document")
     document._FlagAsMethod.assert_called_once_with(
-        "Open", "Close", "GetObject", "SetPrinter", "StartPrint", "PrintOut", "EndPrint",
+        "Open", "Close", "GetObject", "SetPrinter", "StartPrint", "PrintOut", "EndPrint", "Export",
     )
     document.Close.assert_not_called()
     document.StartPrint.assert_not_called()
@@ -474,3 +474,79 @@ def test_bpac_changes_only_variable_objects_and_closes(tmp_path, monkeypatch, mi
         document.EndPrint.assert_called_once()
     document.Close.assert_called_once()
     assert Path(path).is_file()
+
+
+@pytest.mark.parametrize("export_success", [True, False])
+def test_bpac_image_export_uses_filled_template_without_printing(tmp_path, monkeypatch, export_success):
+    if os.name != "nt":
+        pytest.skip("Brother b-PAC Windows")
+    import base64
+    import io
+    import zipfile
+    from src import label_templates as templates
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/></label>')
+    template = {"name": "Bossa", "content": base64.b64encode(buffer.getvalue()).decode(),
+                "fields": {"Producte": "producte"}}
+    job = templates.save_template_job(tmp_path / "job.json", template, {"producte": "Arròs"}, 1)
+    target = tmp_path / "preview.png"
+    target.write_bytes(b"existing image")
+    document = Mock()
+    product = Mock()
+    document.GetObject.return_value = product
+
+    def export(kind, path, resolution):
+        assert kind == 4 and resolution == 0
+        assert product.Text == "Arròs"
+        if export_success:
+            Image.new("RGB", (37, 19), "black").save(path, format="BMP")
+        return export_success
+
+    document.Export.side_effect = export
+    monkeypatch.setattr(templates, "_create_bpac_document", Mock(return_value=document))
+    result = templates.export_template_job_image(job, target, "Brother QL-600")
+
+    assert result["status"] == ("saved" if export_success else "error")
+    document.SetPrinter.assert_called_once_with("Brother QL-600", True)
+    document.StartPrint.assert_not_called()
+    document.PrintOut.assert_not_called()
+    document.Close.assert_called_once()
+    if export_success:
+        with Image.open(target) as image:
+            assert image.format == "PNG"
+            assert image.size == (37, 19)
+            assert image.convert("RGB").getpixel((0, 0)) == (0, 0, 0)
+    else:
+        assert target.read_bytes() == b"existing image"
+
+
+def test_bpac_image_export_reports_missing_object_without_overwriting(tmp_path, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Brother b-PAC Windows")
+    import base64
+    import io
+    import zipfile
+    from src import label_templates as templates
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("label.xml", '<label><objectStyle objectName="Producte"/></label>')
+    template = {"name": "Bossa", "content": base64.b64encode(buffer.getvalue()).decode(),
+                "fields": {"Incorrecte": "producte"}}
+    job = templates.save_template_job(tmp_path / "job.json", template, {"producte": "Arròs"}, 1)
+    target = tmp_path / "preview.png"
+    target.write_bytes(b"existing image")
+    document = Mock()
+    document.GetObject.return_value = None
+    monkeypatch.setattr(templates, "_create_bpac_document", Mock(return_value=document))
+
+    result = templates.export_template_job_image(job, target)
+
+    assert result["status"] == "error"
+    assert "Incorrecte" in result["message"]
+    assert target.read_bytes() == b"existing image"
+    document.SetPrinter.assert_not_called()
+    document.Export.assert_not_called()
+    document.Close.assert_called_once()

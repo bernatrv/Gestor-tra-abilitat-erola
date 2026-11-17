@@ -7,10 +7,12 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from src.db import list_catalog_products
+from src.db import list_catalog_products, list_packaged_products
+from src.label_print import create_template_label_job
 from src.label_templates import (
     ACTION_LABELS, FIELD_LABELS, assign_action_template, assign_product_template, configure_label_template, delete_label_template,
-    import_label_template, load_template_config, product_template_key, set_templates_enabled, template_bytes,
+    export_template_job_image, import_label_template, load_template_config, product_template_key, set_templates_enabled,
+    template_bytes,
 )
 
 
@@ -85,6 +87,9 @@ class TemplateManager(tk.Toplevel):
         self.templates_tree.column("name", width=160)
         self.templates_tree.column("file", width=180)
         self.templates_tree.grid(row=0, column=0, sticky="nsew")
+        ttk.Button(left, text="Comprovar amb un envasat...", command=self._test_template).grid(
+            row=1, column=0, sticky="ew", pady=(6, 0)
+        )
         self.app._attach_scrollbars(self.templates_tree, horizontal=True)
         self.templates_tree.bind("<<TreeviewSelect>>", self._select_template)
         details = ttk.Frame(panel)
@@ -115,6 +120,143 @@ class TemplateManager(tk.Toplevel):
         ttk.Combobox(details, textvariable=self.field_name, state="readonly",
                      values=[FIXED_FIELD, *FIELD_LABELS.values()]).grid(row=4, column=1, sticky="ew", pady=6)
         ttk.Button(details, text="Desar camp", command=self._save_field).grid(row=4, column=2, padx=(6, 0))
+
+    def _test_template(self):
+        if not self._template_id:
+            messagebox.showwarning("Plantilla no seleccionada", "Selecciona la plantilla que vols comprovar.", parent=self)
+            return
+        products = list_packaged_products(self.app.conn)
+        if not products:
+            messagebox.showwarning("Sense historial", "No hi ha cap envasat a l'historial per fer la prova.", parent=self)
+            return
+
+        template_id = self._template_id
+        product_choices = {}
+        for product in products:
+            label = f"{product['name']} | Lot {product['packed_lot']} | {(product['created_at'] or '')[:10]} | #{product['id']}"
+            product_choices[label] = product
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Comprovar plantilla amb un envasat")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        panel = ttk.Frame(dialog, padding=12)
+        panel.grid(sticky="nsew")
+        panel.columnconfigure(0, weight=1)
+        ttk.Label(panel, text="Tria un producte de l'historial d'envasats:").grid(row=0, column=0, sticky="w")
+        selected = tk.StringVar(dialog, value=next(iter(product_choices)))
+        combo = ttk.Combobox(panel, textvariable=selected, values=list(product_choices), state="readonly", width=64)
+        combo.grid(row=1, column=0, sticky="ew", pady=(6, 12))
+        ttk.Label(panel, text="Objectes i valors que s'enviaran a la plantilla:").grid(row=2, column=0, sticky="w")
+        values_tree = ttk.Treeview(panel, columns=("object", "field", "value"), show="headings", height=7)
+        for column, title, width in (("object", "Objecte", 135), ("field", "Dada", 190), ("value", "Valor", 230)):
+            values_tree.heading(column, text=title)
+            values_tree.column(column, width=width)
+        values_tree.grid(row=3, column=0, sticky="nsew", pady=(6, 6))
+        self.app._attach_scrollbars(values_tree, horizontal=True)
+        ttk.Label(panel, text="(Buit) vol dir que la dada no té valor; els objectes fixos mantenen el contingut de la plantilla.",
+                  wraplength=560).grid(row=4, column=0, sticky="w", pady=(0, 10))
+
+        previous_grab = self.grab_current()
+
+        def close():
+            if dialog.grab_current() is dialog:
+                dialog.grab_release()
+            dialog.destroy()
+            if previous_grab is not None and previous_grab.winfo_exists():
+                previous_grab.grab_set()
+
+        def selected_values():
+            product = product_choices.get(selected.get())
+            if product is None:
+                raise ValueError("Selecciona un envasat de l'historial.")
+            template = load_template_config(self.app.conn)["templates"].get(template_id)
+            if template is None:
+                raise ValueError("La plantilla seleccionada ja no existeix.")
+            values = self._test_values_for_packaged_product(product, template)
+            return template, values
+
+        def refresh_values(event=None):
+            values_tree.delete(*values_tree.get_children())
+            try:
+                template, values = selected_values()
+                for name in sorted(set(template["objects"]) | set(template["fields"])):
+                    field = template["fields"].get(name)
+                    if field is None:
+                        field_label, value = FIXED_FIELD, "(fix a la plantilla)"
+                    elif field not in values:
+                        field_label, value = FIELD_LABELS.get(field, field), "(no disponible en l'envasat)"
+                    else:
+                        field_label = FIELD_LABELS.get(field, field)
+                        value = str(values[field]) if values[field] not in ("", None) else "(buit)"
+                    values_tree.insert("", "end", values=(name, field_label, value))
+            except Exception as exc:
+                messagebox.showerror("No s'han pogut consultar les dades", str(exc), parent=dialog)
+
+        def make_job():
+            template, values = selected_values()
+            return create_template_label_job(template, values, 1)
+
+        def print_test_label():
+            try:
+                path = make_job()
+            except Exception as exc:
+                messagebox.showerror("No s'ha pogut preparar la prova", str(exc), parent=dialog)
+                return
+            result = self.app._print_saved_labels([path], parent=dialog)
+            if result.get("status") == "printed":
+                messagebox.showinfo("Prova enviada", "S'ha enviat una etiqueta de prova a la impressora.", parent=dialog)
+
+        def save_test_image():
+            target = filedialog.asksaveasfilename(
+                parent=dialog, title="Desar imatge de prova", defaultextension=".png",
+                filetypes=[("Imatge PNG", "*.png")],
+            )
+            if not target:
+                return
+            try:
+                path = make_job()
+            except Exception as exc:
+                messagebox.showerror("No s'ha pogut preparar la prova", str(exc), parent=dialog)
+                return
+            result = export_template_job_image(path, target, self.app.printer_name)
+            if result["status"] == "saved":
+                message = result["message"]
+                if not self.app.printer_name:
+                    message += "\nNo hi ha impressora configurada; s'ha utilitzat la configuració de la plantilla."
+                messagebox.showinfo("Imatge desada", message, parent=dialog)
+            else:
+                messagebox.showerror("Imatge no generada", result["message"], parent=dialog)
+
+        buttons = ttk.Frame(panel)
+        buttons.grid(row=5, column=0, sticky="e")
+        close_button = ttk.Button(buttons, text="Cancel·lar", command=close)
+        close_button.pack(side="right")
+        image_button = ttk.Button(buttons, text="Desar imatge PNG...", command=save_test_image)
+        image_button.pack(side="right", padx=(0, 6))
+        print_button = ttk.Button(buttons, text="Imprimir etiqueta de prova", command=print_test_label)
+        print_button.pack(side="right", padx=(0, 6))
+        dialog.product_combo = combo
+        dialog.print_button = print_button
+        dialog.image_button = image_button
+        dialog.values_tree = values_tree
+        dialog.close_button = close_button
+        combo.bind("<<ComboboxSelected>>", refresh_values)
+        refresh_values()
+        dialog.protocol("WM_DELETE_WINDOW", close)
+        dialog.bind("<Escape>", lambda event: close())
+        dialog.update_idletasks()
+        dialog.wait_visibility()
+        dialog.grab_set()
+        combo.focus_set()
+        return dialog
+
+    def _test_values_for_packaged_product(self, product, template):
+        return self.app._packaged_template_values(
+            template, product["name"], product["sku"] or "", product["packed_lot"],
+            product["provenance"] or "", product["expiry"], product["weight"],
+            packed_date=(product["created_at"] or "")[:10],
+        )
 
     def _build_products(self, panel):
         panel.columnconfigure(0, weight=1)

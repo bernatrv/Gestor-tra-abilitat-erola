@@ -8,8 +8,11 @@ import os
 import tempfile
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree
+
+from PIL import Image
 
 from src.core import CSV_EXTRA_FIELD_LABELS
 from src.db import get_setting, set_setting
@@ -205,63 +208,95 @@ def _create_bpac_document():
         import win32com.client
 
         document = win32com.client.Dispatch("bpac.Document")
-        document._FlagAsMethod("Open", "Close", "GetObject", "SetPrinter", "StartPrint", "PrintOut", "EndPrint")
+        document._FlagAsMethod("Open", "Close", "GetObject", "SetPrinter", "StartPrint", "PrintOut", "EndPrint", "Export")
         return document
     except Exception as exc:
         raise OSError("Cal instal·lar Brother b-PAC de la mateixa arquitectura (32/64 bits) que el programa.") from exc
 
 
+@contextmanager
+def _filled_bpac_document(path, printer_name):
+    if os.name != "nt":
+        raise OSError("Les plantilles P-touch amb b-PAC només estan disponibles a Windows.")
+    with open(path, encoding="utf-8") as source:
+        job = json.load(source)
+    if job.get("format") != "erola.label-job.v1":
+        raise ValueError("La feina d'etiquetes no té un format vàlid.")
+    copies = job["copies"]
+    if not isinstance(copies, int) or isinstance(copies, bool) or copies < 1:
+        raise ValueError("El nombre d'etiquetes no és vàlid.")
+    fields = job["template"]["fields"]
+    if not fields or any(field not in FIELD_LABELS or field not in job["values"] for field in fields.values()):
+        raise ValueError("La feina no té els camps variables correctament configurats.")
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    try:
+        with tempfile.TemporaryDirectory(prefix="erola-label-") as directory:
+            template_path = Path(directory) / "label.lbx"
+            template_path.write_bytes(template_bytes(job["template"]))
+            document = _create_bpac_document()
+            opened = False
+            try:
+                if not document.Open(str(template_path)):
+                    raise OSError("b-PAC no ha pogut obrir la plantilla.")
+                opened = True
+                if printer_name and not document.SetPrinter(printer_name, True):
+                    raise OSError("b-PAC no ha acceptat la impressora. Selecciona una Brother compatible.")
+                for name, field in fields.items():
+                    target = document.GetObject(name)
+                    if target is None:
+                        raise ValueError(f"No s'ha trobat l'objecte variable '{name}' a la plantilla.")
+                    target.Text = str(job["values"][field])
+                yield document, job, Path(directory)
+            finally:
+                if opened:
+                    document.Close()
+    finally:
+        pythoncom.CoUninitialize()
+
+
 def print_template_job(path, printer_name):
     try:
-        if os.name != "nt":
-            raise OSError("Les plantilles P-touch amb b-PAC només es poden imprimir a Windows.")
         if not printer_name:
             raise ValueError("Selecciona una impressora Brother a Impressió > Configurar impressores.")
-        with open(path, encoding="utf-8") as source:
-            job = json.load(source)
-        if job.get("format") != "erola.label-job.v1":
-            raise ValueError("La feina d'etiquetes no té un format vàlid.")
-        copies = job["copies"]
-        if not isinstance(copies, int) or isinstance(copies, bool) or copies < 1:
-            raise ValueError("El nombre d'etiquetes no és vàlid.")
-        fields = job["template"]["fields"]
-        if not fields or any(field not in FIELD_LABELS or field not in job["values"] for field in fields.values()):
-            raise ValueError("La feina no té els camps variables correctament configurats.")
-        import pythoncom
-
-        pythoncom.CoInitialize()
-        try:
-            with tempfile.TemporaryDirectory(prefix="erola-label-") as directory:
-                template_path = Path(directory) / "label.lbx"
-                template_path.write_bytes(template_bytes(job["template"]))
-                document = _create_bpac_document()
-                opened = started = False
-                try:
-                    if not document.Open(str(template_path)):
-                        raise OSError("b-PAC no ha pogut obrir la plantilla.")
-                    opened = True
-                    if not document.SetPrinter(printer_name, True):
-                        raise OSError("b-PAC no ha acceptat la impressora. Selecciona una Brother compatible.")
-                    for name, field in job["template"]["fields"].items():
-                        target = document.GetObject(name)
-                        if target is None:
-                            raise ValueError(f"No s'ha trobat l'objecte variable '{name}' a la plantilla.")
-                        target.Text = str(job["values"][field])
-                    if not document.StartPrint("erola - " + job["template"]["name"], 0):
-                        raise OSError("b-PAC no ha pogut iniciar la impressió.")
-                    started = True
-                    if not document.PrintOut(job["copies"], 0):
-                        raise OSError("b-PAC no ha confirmat l'enviament. Revisa la cua abans de tornar a imprimir.")
-                    started = False
-                    if document.EndPrint() is False:
-                        raise OSError("b-PAC no ha confirmat el final de la feina. Revisa la cua abans de repetir-la.")
-                finally:
-                    if started:
-                        document.EndPrint()
-                    if opened:
-                        document.Close()
-        finally:
-            pythoncom.CoUninitialize()
+        with _filled_bpac_document(path, printer_name) as (document, job, directory):
+            started = False
+            try:
+                if not document.StartPrint("erola - " + job["template"]["name"], 0):
+                    raise OSError("b-PAC no ha pogut iniciar la impressió.")
+                started = True
+                if not document.PrintOut(job["copies"], 0):
+                    raise OSError("b-PAC no ha confirmat l'enviament. Revisa la cua abans de tornar a imprimir.")
+                started = False
+                if document.EndPrint() is False:
+                    raise OSError("b-PAC no ha confirmat el final de la feina. Revisa la cua abans de repetir-la.")
+            finally:
+                if started:
+                    document.EndPrint()
         return {"status": "printed", "message": "Etiquetes enviades amb la plantilla P-touch."}
+    except Exception as exc:
+        return {"status": "error", "message": f"{exc}\nFeina conservada a: {path}"}
+
+
+def export_template_job_image(path, target_path, printer_name=None):
+    try:
+        target = Path(target_path).resolve()
+        if target.suffix.lower() != ".png":
+            raise ValueError("El fitxer de destinació ha de ser una imatge PNG.")
+        with _filled_bpac_document(path, printer_name) as (document, job, directory):
+            bitmap = directory / "label.bmp"
+            if not document.Export(4, str(bitmap), 0):
+                raise OSError("b-PAC no ha pogut generar la imatge de la plantilla.")
+            with Image.open(bitmap) as image:
+                image.load()
+                with tempfile.NamedTemporaryFile(prefix=".erola-label-", suffix=".png", dir=target.parent, delete=False) as output:
+                    temporary = Path(output.name)
+                try:
+                    image.save(temporary, format="PNG")
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        return {"status": "saved", "message": f"Imatge desada a: {target}"}
     except Exception as exc:
         return {"status": "error", "message": f"{exc}\nFeina conservada a: {path}"}
